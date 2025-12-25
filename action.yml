@@ -19,23 +19,115 @@ inputs:
   additional_comments:
     description: 'Additional comments for the review'
     required: false
+  gemini_model:
+    description: 'The Gemini model to use for AI review generation'
+    required: false
+    default: 'gemini-3-pro-preview'
 outputs:
   review_text:
     description: "The generated review text"
-    value: ${{ steps.run_review.outputs.review_text }}uns:
+    value: ${{ steps.run_review.outputs.review_text }}
+uns:
   using: "composite"
   steps:
     - name: Checkout repository
-      uses: actions/checkout@v5
+      uses: actions/checkout@v6.0.1
+      with:
+        fetch-depth: 0
 
     - name: Set up Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v6.1.0
       with:
-        python-version: '3.11'
+        python-version: '3.13'
+        cache: 'pip'
+
+    - name: Set up Lean and Build
+      uses: leanprover/lean-action@v1
+      with:
+        build: true
+        test: false
+        lint: false
+
 
     - name: Install dependencies
       run: pip install -r ${{ github.action_path }}/requirements.txt
       shell: bash
+
+    - name: Discover Related Files
+      id: discover_files
+      shell: python
+      run: |
+        import subprocess
+        import json
+        import os
+        import sys
+
+        def get_changed_lean_files(base_ref, head_ref):
+            try:
+                command = f"git diff --name-only {base_ref} {head_ref}"
+                result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+                changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip().endswith('.lean')]
+                return changed_files
+            except subprocess.CalledProcessError as e:
+                print(f"::error::Failed to get changed files: {e.stderr}")
+                return []
+
+        def get_lean_module_name(file_path):
+            # e.g., src/My/Module.lean -> My.Module
+            if file_path.startswith("src/"):
+                file_path = file_path[4:] # Remove 'src/' prefix
+            return file_path.replace('/', '.').replace('.lean', '')
+
+        def get_dependent_lean_files(changed_modules, lake_graph_json):
+            dependent_modules = set()
+            for module_info in lake_graph_json:
+                module_name = module_info['name']
+                # Only consider modules that import other modules within the same project
+                # and are not one of the changed modules themselves.
+                if any(imp in changed_modules for imp in module_info.get('imports', [])) and module_name not in changed_modules:
+                    dependent_modules.add(module_name)
+            return list(dependent_modules)
+
+        def convert_module_to_file_path(module_name):
+            # e.g., My.Module -> src/My/Module.lean
+            return os.path.join('src', *module_name.split('.')) + '.lean'
+
+        base_ref = os.environ.get('GITHUB_BASE_REF', 'origin/main') # Default to main if not a PR
+        head_ref = os.environ.get('GITHUB_SHA', 'HEAD')
+
+        changed_files = get_changed_lean_files(base_ref, head_ref)
+        changed_modules = {get_lean_module_name(f) for f in changed_files}
+
+        all_relevant_files = set(changed_files)
+
+        try:
+            print("Attempting to generate Lake dependency graph...")
+            lake_graph_output = subprocess.run(
+                ['lake', 'exe', 'graph', '--json'],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=300 # 5 minutes timeout for lake graph
+            ).stdout
+            lake_graph_json = json.loads(lake_graph_output)
+            print("Successfully generated Lake dependency graph.")
+
+            dependent_modules = get_dependent_lean_files(changed_modules, lake_graph_json)
+            dependent_files = {convert_module_to_file_path(m) for m in dependent_modules}
+
+            all_relevant_files.update(dependent_files)
+
+        except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
+            print(f"::warning::Could not generate or parse Lake graph for full dependency analysis: {e}")
+            print("::warning::Falling back to only changed files for context.")
+            # In case of error, all_relevant_files already contains just changed_files
+
+        final_file_list = sorted(list(all_relevant_files))
+        output_string = ','.join(final_file_list)
+
+        print(f"::notice::Discovered files for review: {output_string}")
+        print(f"discovered_files={output_string}")
+
 
     - name: Run AI Review Script
       id: run_review
@@ -50,8 +142,9 @@ outputs:
         python ${{ github.action_path }}/review.py \
           --pr-number ${{ inputs.pr_number }} \
           --external-refs "${{ inputs.external_refs }}" \
-          --arklib-refs "${{ inputs.arklib_refs }}" \
-          --additional-comments "${{ inputs.additional_comments }}" >> $GITHUB_OUTPUT
+          --arklib-refs "${{ inputs.arklib_refs }},${{ steps.discover_files.outputs.discovered_files }}" \
+          --additional-comments "${{ inputs.additional_comments }}" \
+          --gemini-model "${{ inputs.gemini_model }}" >> $GITHUB_OUTPUT
         echo "$EOF_MARKER" >> $GITHUB_OUTPUT
 
     - name: Post Review Comment
@@ -59,6 +152,7 @@ outputs:
       env:
         REVIEW_TEXT: ${{ steps.run_review.outputs.review_text }}
       with:
+        retries: 3
         script: |
           const header = '### 🤖 AI Review (with external context)\n\n';
           const reviewBody = process.env.REVIEW_TEXT;
