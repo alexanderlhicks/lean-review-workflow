@@ -42,11 +42,11 @@ uns:
         cache: 'pip'
 
     - name: Set up Lean and Build
-      uses: leanprover/lean-action@v1
+      uses: leanprover/lean-action@v1.3
       with:
         build: true
         test: false
-        lint: false
+        lint: true
 
 
     - name: Install dependencies
