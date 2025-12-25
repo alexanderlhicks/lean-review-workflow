@@ -1,0 +1,71 @@
+name: AI Code Review Action
+description: 'Performs an AI code review based on comments'
+inputs:
+  github_token:
+    description: 'GitHub Token for API calls'
+    required: true
+  gemini_api_key:
+    description: 'Gemini API Key for AI review generation'
+    required: true
+  pr_number:
+    description: 'The Pull Request number'
+    required: true
+  external_refs:
+    description: 'External references for context'
+    required: false
+  arklib_refs:
+    description: 'ArkLib references for context'
+    required: false
+  additional_comments:
+    description: 'Additional comments for the review'
+    required: false
+outputs:
+  review_text:
+    description: "The generated review text"
+    value: ${{ steps.run_review.outputs.review_text }}uns:
+  using: "composite"
+  steps:
+    - name: Checkout repository
+      uses: actions/checkout@v5
+
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: pip install -r ${{ github.action_path }}/requirements.txt
+      shell: bash
+
+    - name: Run AI Review Script
+      id: run_review
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+      run: |
+        # Run the script and capture its output to post as a comment later
+        # We use a special "end of file" marker to handle multiline output
+        EOF_MARKER=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
+        echo "review_text<<$EOF_MARKER" >> $GITHUB_OUTPUT
+        python ${{ github.action_path }}/review.py \
+          --pr-number ${{ inputs.pr_number }} \
+          --external-refs "${{ inputs.external_refs }}" \
+          --arklib-refs "${{ inputs.arklib_refs }}" \
+          --additional-comments "${{ inputs.additional_comments }}" >> $GITHUB_OUTPUT
+        echo "$EOF_MARKER" >> $GITHUB_OUTPUT
+
+    - name: Post Review Comment
+      uses: actions/github-script@v8
+      env:
+        REVIEW_TEXT: ${{ steps.run_review.outputs.review_text }}
+      with:
+        script: |
+          const header = '### 🤖 AI Review (with external context)\n\n';
+          const reviewBody = process.env.REVIEW_TEXT;
+
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: header + reviewBody
+          });
