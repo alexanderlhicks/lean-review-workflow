@@ -73,26 +73,45 @@ uns:
                 return []
 
         def get_lean_module_name(file_path):
+            # Assumes a standard Lean project structure, adjust if necessary
             # e.g., src/My/Module.lean -> My.Module
             if file_path.startswith("src/"):
-                file_path = file_path[4:] # Remove 'src/' prefix
+                file_path = file_path[4:]
+            elif file_path.startswith("Mathlib/"): # Common in mathlib projects
+                file_path = file_path[8:]
             return file_path.replace('/', '.').replace('.lean', '')
 
         def get_dependent_lean_files(changed_modules, lake_graph_json):
             dependent_modules = set()
             for module_info in lake_graph_json:
                 module_name = module_info['name']
-                # Only consider modules that import other modules within the same project
-                # and are not one of the changed modules themselves.
                 if any(imp in changed_modules for imp in module_info.get('imports', [])) and module_name not in changed_modules:
                     dependent_modules.add(module_name)
             return list(dependent_modules)
 
-        def convert_module_to_file_path(module_name):
-            # e.g., My.Module -> src/My/Module.lean
-            return os.path.join('src', *module_name.split('.')) + '.lean'
+        def get_dependency_lean_files(changed_modules, lake_graph_json):
+            dependency_modules = set()
+            for module_info in lake_graph_json:
+                if module_info['name'] in changed_modules:
+                    dependency_modules.update(module_info.get('imports', []))
+            # We don't want to include dependencies that were also changed in the PR
+            return list(dependency_modules - changed_modules)
 
-        base_ref = os.environ.get('GITHUB_BASE_REF', 'origin/main') # Default to main if not a PR
+        def convert_module_to_file_path(module_name):
+            # This needs to be robust enough for your project's structure.
+            # It might involve checking a `lean-toolchain` or `lake-manifest.json`
+            # for dependency paths. For now, we assume a simple structure.
+            # Example for a project with local files in 'src' and deps in 'lake-packages'
+            # This part might need significant adjustment for real-world complex projects.
+            parts = module_name.split('.')
+            # A simple heuristic: check for common library prefixes. This is not foolproof.
+            if module_name.startswith("Mathlib"):
+                return os.path.join('lake-packages', 'mathlib', 'Mathlib', *parts[1:]) + '.lean'
+            # Assume local files are in 'src'
+            return os.path.join('src', *parts) + '.lean'
+
+
+        base_ref = os.environ.get('GITHUB_BASE_REF', 'origin/main')
         head_ref = os.environ.get('GITHUB_SHA', 'HEAD')
 
         changed_files = get_changed_lean_files(base_ref, head_ref)
@@ -107,26 +126,30 @@ uns:
                 check=True,
                 capture_output=True,
                 text=True,
-                timeout=300 # 5 minutes timeout for lake graph
+                timeout=300
             ).stdout
             lake_graph_json = json.loads(lake_graph_output)
             print("Successfully generated Lake dependency graph.")
 
+            # Find files that depend ON our changed files
             dependent_modules = get_dependent_lean_files(changed_modules, lake_graph_json)
             dependent_files = {convert_module_to_file_path(m) for m in dependent_modules}
-
             all_relevant_files.update(dependent_files)
+
+            # Find files that our changed files depend ON
+            dependency_modules = get_dependency_lean_files(changed_modules, lake_graph_json)
+            dependency_files = {convert_module_to_file_path(m) for m in dependency_modules}
+            all_relevant_files.update(dependency_files)
 
         except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
             print(f"::warning::Could not generate or parse Lake graph for full dependency analysis: {e}")
             print("::warning::Falling back to only changed files for context.")
-            # In case of error, all_relevant_files already contains just changed_files
 
-        final_file_list = sorted(list(all_relevant_files))
+        final_file_list = sorted([f for f in all_relevant_files if os.path.exists(f)])
         output_string = ','.join(final_file_list)
 
         print(f"::notice::Discovered files for review: {output_string}")
-        print(f"discovered_files={output_string}")
+        print(f"::set-output name=discovered_files::{output_string}")
 
 
     - name: Run AI Review Script
