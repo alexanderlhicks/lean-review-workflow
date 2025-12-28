@@ -3,7 +3,7 @@ import argparse
 import subprocess
 import requests
 from bs4 import BeautifulSoup
-import google.generativeai as genai
+from google import genai
 import fitz
 import io
 import logging
@@ -110,9 +110,8 @@ def analyze_file_changes_with_context(review_context: dict, file_path: str, file
     if not api_key:
         return "Error: GEMINI_API_KEY not set."
 
-    gemini_model = review_context.get("gemini_model", "gemini-3-pro-preview")
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(gemini_model)
+    client = genai.Client(api_key=api_key)
+    # model = genai.GenerativeModel(gemini_model) # Old way
 
     action_path = os.path.dirname(os.path.realpath(__file__))
     prompt_template_path = os.path.join(action_path, "prompts", "review_file.md")
@@ -140,7 +139,7 @@ def analyze_file_changes_with_context(review_context: dict, file_path: str, file
     
     try:
         logging.info(f"Generating review for file: {file_path}...")
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model=gemini_model, contents=prompt)
         return response.text
     except Exception as e:
         logging.error(f"Error during Gemini API call for {file_path}: {e}")
@@ -166,11 +165,10 @@ def synthesize_overall_summary(per_file_reviews: Dict[str, str], model_name: str
 
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key: return "Error: GEMINI_API_KEY not set."
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+    client = genai.Client(api_key=api_key)
     try:
         logging.info("Synthesizing overall summary...")
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(model=model_name, contents=prompt)
         return response.text
     except Exception as e:
         logging.error(f"Error during Gemini API call for summary synthesis: {e}")
