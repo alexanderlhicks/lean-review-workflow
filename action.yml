@@ -27,7 +27,7 @@ outputs:
   review_text:
     description: "The generated review text"
     value: ${{ steps.run_review.outputs.review_text }}
-uns:
+runs:
   using: "composite"
   steps:
     - name: Checkout repository
@@ -35,11 +35,16 @@ uns:
       with:
         fetch-depth: 0
 
+    - name: Copy action requirements
+      run: cp ${{ github.action_path }}/requirements.txt ./action-requirements.txt
+      shell: bash
+
     - name: Set up Python
       uses: actions/setup-python@v6.1.0
       with:
         python-version: '3.13'
         cache: 'pip'
+        cache-dependency-path: ./action-requirements.txt
 
     - name: Set up Lean and Build
       uses: leanprover/lean-action@v1.3
@@ -50,7 +55,7 @@ uns:
 
 
     - name: Install dependencies
-      run: pip install -r ${{ github.action_path }}/requirements.txt
+      run: pip install -r ./action-requirements.txt
       shell: bash
 
     - name: Discover Related Files
@@ -186,3 +191,9 @@ uns:
             repo: context.repo.repo,
             body: header + reviewBody
           });
+
+    - name: Clean up artifacts
+      if: always()
+      shell: bash
+      run: |
+        rm ./action-requirements.txt
