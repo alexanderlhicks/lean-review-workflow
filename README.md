@@ -9,7 +9,7 @@ This GitHub Action provides an advanced, AI-powered code review for Pull Request
 *   **Structured, File-by-File Review Output:** Provides an overall summary of the PR, followed by detailed and collapsible review sections for each individual Lean file changed.
 *   **Customizable AI Prompts:** The core instructions given to the AI are stored in external Markdown files, allowing for easy customization and fine-tuning of the review's focus and style.
 *   **External Reference Integration:** Fetches and extracts content from external URLs (PDFs, HTML pages) to provide the AI with formal specifications or documentation for comparison against the PR's implementation.
-*   **Internal ArkLib Context:** Allows developers to explicitly provide paths to additional relevant files or directories within the repository (e.g., specific library files, internal documentation) to augment the AI's understanding.
+*   **Additional Repository Context:** Allows developers to explicitly provide paths to additional relevant files or directories within the repository (via `repo_context_refs`). This input can be dynamically generated (e.g., from a PR comment) to augment the AI's understanding with expert-selected or non-discoverable context.
 *   **Flexible Review Comments:** Supports additional, human-provided comments to guide the AI's focus during the review process.
 *   **Robust Error Handling:** Features enhanced error handling, logging, and graceful fallbacks for scenarios like failed dependency graph generation or inaccessible external references.
 *   **Configurable Gemini Model:** The specific Gemini model used for the review can be easily configured via action inputs.
@@ -55,14 +55,14 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           pr_number: ${{ github.event.pull_request.number }}
-          # Optional: Provide URLs to external formal specifications or documentation
+          # Optional: Provide URLs to external formal specifications or documentation (can be dynamic, e.g., parsed from a PR comment)
           external_refs: "https://example.com/spec.pdf, https://another.com/design.html"
-          # Optional: Provide paths to internal repository files or directories for additional context
-          arklib_refs: "src/MyProject/FormalSpec.lean, src/MyProject/Types.lean, docs/architecture.md"
-          # Optional: Add specific instructions or focus areas for the AI reviewer
+          # Optional: Provide paths to additional repository files or directories for context (can be dynamic, e.g., parsed from a PR comment)
+          repo_context_refs: "src/MyProject/FormalSpec.lean, src/MyProject/Types.lean, docs/architecture.md"
+          # Optional: Add specific instructions or focus areas for the AI reviewer (can be dynamic, e.g., parsed from a PR comment)
           additional_comments: "Pay special attention to the proof completeness and adherence to the type class inference rules."
           # Optional: Specify a different Gemini model (default is 'gemini-3-pro-preview')
-          gemini_model: "gemini-1.5-pro-preview"
+          gemini_model: "gemini-3-pro-preview"
 ```
 
 ### Inputs
@@ -71,7 +71,7 @@ jobs:
 *   `gemini_api_key` (Required): Gemini API Key for AI review generation. Store this as a repository secret.
 *   `pr_number` (Required): The Pull Request number. Use `${{ github.event.pull_request.number }}`.
 *   `external_refs` (Optional): Comma-separated list of URLs to external documents (PDFs, HTML) for contextual information.
-*   `arklib_refs` (Optional): Comma-separated list of paths to relevant files or directories within the repository for additional context.
+*   `repo_context_refs` (Optional): Comma-separated list of paths to relevant files or directories within the repository for additional context. Can be provided dynamically (e.g., from a PR comment).
 *   `additional_comments` (Optional): Extra comments or instructions for the AI reviewer.
 *   `gemini_model` (Optional): The specific Gemini model to use (default: `gemini-3-pro-preview`).
 

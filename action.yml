@@ -13,8 +13,8 @@ inputs:
   external_refs:
     description: 'External references for context'
     required: false
-  arklib_refs:
-    description: 'ArkLib references for context'
+  repo_context_refs:
+    description: 'Comma-separated paths to additional repository files or directories for context'
     required: false
   additional_comments:
     description: 'Additional comments for the review'
@@ -165,7 +165,7 @@ uns:
         python ${{ github.action_path }}/review.py \
           --pr-number ${{ inputs.pr_number }} \
           --external-refs "${{ inputs.external_refs }}" \
-          --arklib-refs "${{ inputs.arklib_refs }},${{ steps.discover_files.outputs.discovered_files }}" \
+          --repo-context-refs "${{ inputs.repo_context_refs }},${{ steps.discover_files.outputs.discovered_files }}" \
           --additional-comments "${{ inputs.additional_comments }}" \
           --gemini-model "${{ inputs.gemini_model }}" >> $GITHUB_OUTPUT
         echo "$EOF_MARKER" >> $GITHUB_OUTPUT

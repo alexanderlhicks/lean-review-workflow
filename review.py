@@ -178,7 +178,7 @@ def main():
     parser = argparse.ArgumentParser(description="AI Code Reviewer")
     parser.add_argument("--pr-number", required=True)
     parser.add_argument("--external-refs", default="")
-    parser.add_argument("--arklib-refs", default="")
+    parser.add_argument("--repo-context-refs", default="")
     parser.add_argument("--additional-comments", default="")
     parser.add_argument("--gemini-model", default="gemini-3-pro-preview")
     args = parser.parse_args()
@@ -189,7 +189,7 @@ def main():
         return
 
     external_context, external_errors = get_document_content(args.external_refs)
-    repo_context, repo_errors = get_repo_files_content(args.arklib_refs)
+    repo_context, repo_errors = get_repo_files_content(args.repo_context_refs)
 
     all_errors = diff_errors + external_errors + repo_errors
     if all_errors:
