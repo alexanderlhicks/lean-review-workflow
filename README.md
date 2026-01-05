@@ -63,6 +63,8 @@ jobs:
           additional_comments: "Pay special attention to the proof completeness and adherence to the type class inference rules."
           # Optional: Specify a different Gemini model (default is 'gemini-3-pro-preview')
           gemini_model: "gemini-3-pro-preview"
+          # Optional: Whether to run the linter (default is 'false')
+          lint: "true"
 ```
 
 ### Inputs
