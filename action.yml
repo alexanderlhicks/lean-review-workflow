@@ -158,6 +158,7 @@ runs:
 
 
     - name: Run AI Review Script
+      shell: bash
       id: run_review
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
