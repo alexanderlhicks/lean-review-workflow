@@ -74,6 +74,7 @@ jobs:
 *   `repo_context_refs` (Optional): Comma-separated list of paths to relevant files or directories within the repository for additional context. Can be provided dynamically (e.g., from a PR comment).
 *   `additional_comments` (Optional): Extra comments or instructions for the AI reviewer.
 *   `gemini_model` (Optional): The specific Gemini model to use (default: `gemini-3-pro-preview`).
+*   `lint` (Optional): Whether to run the linter (default: `false`).
 
 ## Development
 
