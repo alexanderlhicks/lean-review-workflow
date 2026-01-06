@@ -120,7 +120,16 @@ runs:
             return os.path.join('src', *parts) + '.lean'
 
 
-        base_ref = os.environ.get('GITHUB_BASE_REF', 'origin/main')
+        base_ref = os.environ.get('GITHUB_BASE_REF')
+        if not base_ref:
+             base_ref = 'origin/main'
+        elif not base_ref.startswith('origin/'):
+             # Try to see if the ref exists, if not, prepend origin/
+             try:
+                 subprocess.run(f"git rev-parse --verify {base_ref}", shell=True, check=True, capture_output=True)
+             except subprocess.CalledProcessError:
+                 base_ref = f"origin/{base_ref}"
+
         head_ref = os.environ.get('GITHUB_SHA', 'HEAD')
 
         changed_files = get_changed_lean_files(base_ref, head_ref)

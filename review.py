@@ -139,6 +139,7 @@ def analyze_file_changes_with_context(review_context: dict, file_path: str, file
     
     try:
         logging.info(f"Generating review for file: {file_path}...")
+        gemini_model = review_context.get("gemini_model")
         response = client.models.generate_content(model=gemini_model, contents=prompt)
         return response.text
     except Exception as e:
