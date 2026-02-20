@@ -111,7 +111,6 @@ def analyze_file_changes_with_context(review_context: dict, file_path: str, file
         return "Error: GEMINI_API_KEY not set."
 
     client = genai.Client(api_key=api_key)
-    # model = genai.GenerativeModel(gemini_model) # Old way
 
     action_path = os.path.dirname(os.path.realpath(__file__))
     prompt_template_path = os.path.join(action_path, "prompts", "review_file.md")
@@ -181,7 +180,7 @@ def main():
     parser.add_argument("--external-refs", default="")
     parser.add_argument("--repo-context-refs", default="")
     parser.add_argument("--additional-comments", default="")
-    parser.add_argument("--gemini-model", default="gemini-3-pro-preview")
+    parser.add_argument("--gemini-model", default="gemini-3.1-pro-preview")
     args = parser.parse_args()
 
     diff, diff_errors = get_pr_diff(args.pr_number)
