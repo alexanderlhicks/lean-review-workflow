@@ -2,4 +2,4 @@ requests
 beautifulsoup4
 PyMuPDF
 google-genai
-PyGithub
+pydantic

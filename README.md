@@ -4,10 +4,14 @@ This GitHub Action provides an advanced, AI-powered code review for Pull Request
 
 ## Features
 
-*   **AI-Powered Rigorous Review:** Utilizes a specified Gemini model (`gemini-3-pro-preview` by default) to act as a "meticulous senior engineer specializing in formal verification." The AI follows a detailed "chain-of-thought" process to identify misformalization.
-*   **Enhanced Lean Dependency Discovery:** Automatically identifies relevant Lean files impacted by a PR by leveraging `lake exe graph --json`. This ensures the AI receives a comprehensive understanding of the code's context, including both modules that the changed code *depends on* and modules that *depend on* the changed code.
+*   **Multi-Agent AI Architecture:** Transforms the review process into a specialized pipeline:
+    1.  **Specification Analyst (Agent A):** Reads external PDFs and math papers to extract a rigorous "Formalization Checklist" of concepts and edge cases that must be handled.
+    2.  **Code Reviewer (Agent B):** Evaluates the Lean PR diffs and full file contents strictly against the formal checklist provided by Agent A, checking for universe errors, off-by-one errors, and misformalizations.
+    3.  **Lead Synthesizer (Agent C):** Aggregates the findings into a clear, prioritized executive summary for the Pull Request.
+*   **Enhanced Lean Dependency Discovery:** Automatically identifies relevant Lean files impacted by a PR by leveraging `lake exe graph --json`. 
+*   **Parallel File Processing:** Reviews multiple files concurrently, drastically speeding up the review process for large pull requests.
 *   **Structured, File-by-File Review Output:** Provides an overall summary of the PR, followed by detailed and collapsible review sections for each individual Lean file changed.
-*   **Customizable AI Prompts:** The core instructions given to the AI are stored in external Markdown files, allowing for easy customization and fine-tuning of the review's focus and style.
+*   **Customizable AI Prompts:** The core instructions given to the AI are stored in external Markdown files (`prompts/`), allowing for easy customization of the agents' personas.
 *   **External Reference Integration:** Fetches and extracts content from external URLs (PDFs, HTML pages) to provide the AI with formal specifications or documentation for comparison against the PR's implementation.
 *   **Additional Repository Context:** Allows developers to explicitly provide paths to additional relevant files or directories within the repository (via `repo_context_refs`). This input can be dynamically generated (e.g., from a PR comment) to augment the AI's understanding with expert-selected or non-discoverable context.
 *   **Flexible Review Comments:** Supports additional, human-provided comments to guide the AI's focus during the review process.

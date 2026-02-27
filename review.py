@@ -2,6 +2,7 @@ import os
 import argparse
 import subprocess
 import requests
+import json
 from bs4 import BeautifulSoup
 from google import genai
 import fitz
@@ -9,11 +10,68 @@ import io
 import logging
 import re
 from typing import Tuple, List, Dict
+from concurrent.futures import ThreadPoolExecutor
+from pydantic import BaseModel, Field
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# --- Pydantic Schemas for Multi-Agent Orchestration ---
+class ChecklistItem(BaseModel):
+    concept: str = Field(description="The mathematical concept or theorem name.")
+    verification_steps: list[str] = Field(description="List of specific things to check for to avoid misformalization.")
+
+class SpecChecklist(BaseModel):
+    items: list[ChecklistItem] = Field(description="List of checklist items derived from the specification.")
+
 # --- Helper Functions ---
+def analyze_specification(external_context: str, model_name: str) -> str:
+    """Agent A: Analyzes the external specification and generates a checklist."""
+    if not external_context.strip():
+        return ""
+    
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key: 
+        return ""
+    
+    client = genai.Client(api_key=api_key)
+    action_path = os.path.dirname(os.path.realpath(__file__))
+    prompt_template_path = os.path.join(action_path, "prompts", "analyze_spec.md")
+    
+    try:
+        with open(prompt_template_path, "r") as f:
+            prompt_template = f.read()
+    except FileNotFoundError:
+        logging.error(f"Error: Prompt template not found at {prompt_template_path}")
+        return ""
+
+    prompt = prompt_template.replace("{{EXTERNAL_CONTEXT}}", external_context)
+    
+    try:
+        logging.info("Agent A (Spec Analyst) is generating the formalization checklist...")
+        response = client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config={
+                'response_mime_type': 'application/json',
+                'response_schema': SpecChecklist,
+            }
+        )
+        
+        # Parse the JSON response into a formatted markdown checklist
+        data = json.loads(response.text)
+        checklist_str = ""
+        for item in data.get('items', []):
+            checklist_str += f"- **{item.get('concept')}**\n"
+            for step in item.get('verification_steps', []):
+                checklist_str += f"  - [ ] {step}\n"
+        
+        logging.info("Spec checklist generated successfully.")
+        return checklist_str
+    except Exception as e:
+        logging.error(f"Error during Spec Analysis: {e}")
+        return ""
+
 def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
     """Fetches the diff of the specified pull request."""
     logging.info(f"Fetching PR diff for PR #{pr_number}...")
@@ -104,8 +162,8 @@ def split_diff_into_files(diff_content: str) -> Dict[str, str]:
             files[file_path] = file_diff
     return files
 
-def analyze_file_changes_with_context(review_context: dict, file_path: str, file_diff: str) -> str:
-    """Generates a detailed code review for a single file using the specified Gemini model."""
+def analyze_file_changes_with_context(review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str) -> str:
+    """Agent B (Code Reviewer): Generates a detailed code review for a single file using the specified Gemini model and the Checklist."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return "Error: GEMINI_API_KEY not set."
@@ -113,7 +171,10 @@ def analyze_file_changes_with_context(review_context: dict, file_path: str, file
     client = genai.Client(api_key=api_key)
 
     action_path = os.path.dirname(os.path.realpath(__file__))
-    prompt_template_path = os.path.join(action_path, "prompts", "review_file.md")
+    
+    # Select the appropriate prompt depending on if we have a checklist from Agent A
+    prompt_file = "review_code_with_spec.md" if spec_checklist else "review_file.md"
+    prompt_template_path = os.path.join(action_path, "prompts", prompt_file)
 
     try:
         with open(prompt_template_path, "r") as f:
@@ -131,13 +192,15 @@ def analyze_file_changes_with_context(review_context: dict, file_path: str, file
 """
 
     prompt = prompt_template.replace("{{EXTERNAL_CONTEXT}}", review_context.get("external_context", "")) \
+                            .replace("{{SPEC_CHECKLIST}}", spec_checklist) \
                             .replace("{{REPO_CONTEXT}}", review_context.get("repo_context", "")) \
                             .replace("{{FILE_PATH}}", file_path) \
                             .replace("{{FILE_DIFF}}", file_diff) \
+                            .replace("{{FULL_CONTENT}}", full_content) \
                             .replace("{{ADDITIONAL_COMMENTS}}", additional_comments_section)
     
     try:
-        logging.info(f"Generating review for file: {file_path}...")
+        logging.info(f"Agent B is reviewing file: {file_path}...")
         gemini_model = review_context.get("gemini_model")
         response = client.models.generate_content(model=gemini_model, contents=prompt)
         return response.text
@@ -180,7 +243,7 @@ def main():
     parser.add_argument("--external-refs", default="")
     parser.add_argument("--repo-context-refs", default="")
     parser.add_argument("--additional-comments", default="")
-    parser.add_argument("--gemini-model", default="gemini-3.1-pro-preview")
+    parser.add_argument("--gemini-model", default="gemini-2.0-flash")
     args = parser.parse_args()
 
     diff, diff_errors = get_pr_diff(args.pr_number)
@@ -203,15 +266,39 @@ def main():
         "additional_comments": args.additional_comments,
         "gemini_model": args.gemini_model,
     }
+    
+    # --- Multi-Agent Orchestration Step 1: Spec Analysis ---
+    spec_checklist = analyze_specification(external_context, args.gemini_model)
+    if spec_checklist:
+        logging.info("Spec Analysis complete. Handing off checklist to Code Reviewers.")
+    else:
+        logging.info("No external specification provided or analysis failed. Proceeding with standard review.")
 
     diff_by_file = split_diff_into_files(diff)
-    per_file_reviews = {}
-    for file_path, file_diff in diff_by_file.items():
+    
+    def process_file(file_path, file_diff):
         if not file_path.endswith(".lean"):
             logging.info(f"Skipping non-Lean file: {file_path}")
-            continue
-        review_text = analyze_file_changes_with_context(review_context, file_path, file_diff)
-        per_file_reviews[file_path] = review_text
+            return None, None
+        
+        full_content = ""
+        if os.path.exists(file_path):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    full_content = f.read()
+            except Exception as e:
+                logging.error(f"Error reading {file_path}: {e}")
+        
+        # --- Multi-Agent Orchestration Step 2: Code Review against Checklist ---
+        review_text = analyze_file_changes_with_context(review_context, file_path, file_diff, full_content, spec_checklist)
+        return file_path, review_text
+
+    per_file_reviews = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        results = executor.map(lambda p: process_file(*p), diff_by_file.items())
+        for file_path, review_text in results:
+            if file_path:
+                per_file_reviews[file_path] = review_text
     
     overall_summary = synthesize_overall_summary(per_file_reviews, args.gemini_model)
 

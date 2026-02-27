@@ -22,7 +22,7 @@ inputs:
   gemini_model:
     description: 'The Gemini model to use for AI review generation'
     required: false
-    default: 'gemini-3-pro-preview'
+    default: 'gemini-2.0-flash'
   lint:
     description: 'Whether to run the linter'
     required: false
@@ -164,10 +164,21 @@ runs:
             print("::warning::Falling back to only changed files for context.")
 
         final_file_list = sorted([f for f in all_relevant_files if os.path.exists(f)])
+        
+        # Limit the number of context files to 15 to avoid token bloat
+        CONTEXT_LIMIT = 15
+        if len(final_file_list) > CONTEXT_LIMIT:
+            print(f"::warning::Discovered {len(final_file_list)} files, capping context to {CONTEXT_LIMIT} most relevant.")
+            # Prioritize changed files, then dependencies
+            changed_first = [f for f in final_file_list if f in changed_files]
+            others = [f for f in final_file_list if f not in changed_files]
+            final_file_list = (changed_first + others)[:CONTEXT_LIMIT]
+
         output_string = ','.join(final_file_list)
 
         print(f"::notice::Discovered files for review: {output_string}")
-        print(f"::set-output name=discovered_files::{output_string}")
+        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+            f.write(f"discovered_files={output_string}\n")
 
 
     - name: Run AI Review Script
@@ -176,17 +187,22 @@ runs:
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
         GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        EXTERNAL_REFS: ${{ inputs.external_refs }}
+        REPO_CONTEXT_REFS: ${{ inputs.repo_context_refs }},${{ steps.discover_files.outputs.discovered_files }}
+        ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
+        GEMINI_MODEL: ${{ inputs.gemini_model }}
       run: |
         # Run the script and capture its output to post as a comment later
         # We use a special "end of file" marker to handle multiline output
         EOF_MARKER=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
         echo "review_text<<$EOF_MARKER" >> $GITHUB_OUTPUT
         python ${{ github.action_path }}/review.py \
-          --pr-number ${{ inputs.pr_number }} \
-          --external-refs "${{ inputs.external_refs }}" \
-          --repo-context-refs "${{ inputs.repo_context_refs }},${{ steps.discover_files.outputs.discovered_files }}" \
-          --additional-comments "${{ inputs.additional_comments }}" \
-          --gemini-model "${{ inputs.gemini_model }}" >> $GITHUB_OUTPUT
+          --pr-number "$PR_NUMBER" \
+          --external-refs "$EXTERNAL_REFS" \
+          --repo-context-refs "$REPO_CONTEXT_REFS" \
+          --additional-comments "$ADDITIONAL_COMMENTS" \
+          --gemini-model "$GEMINI_MODEL" >> $GITHUB_OUTPUT
         echo "$EOF_MARKER" >> $GITHUB_OUTPUT
 
     - name: Post Review Comment
@@ -197,14 +213,35 @@ runs:
         retries: 3
         script: |
           const header = '### 🤖 AI Review (with external context)\n\n';
-          const reviewBody = process.env.REVIEW_TEXT;
+          const body = header + process.env.REVIEW_TEXT;
+          const { owner, repo } = context.repo;
+          const issue_number = context.issue.number;
 
-          github.rest.issues.createComment({
-            issue_number: context.issue.number,
-            owner: context.repo.owner,
-            repo: context.repo.repo,
-            body: header + reviewBody
+          const comments = await github.rest.issues.listComments({
+            owner,
+            repo,
+            issue_number,
           });
+
+          const botComment = comments.data.find(comment => 
+            comment.user.type === 'Bot' && comment.body.includes('### 🤖 AI Review')
+          );
+
+          if (botComment) {
+            await github.rest.issues.updateComment({
+              owner,
+              repo,
+              comment_id: botComment.id,
+              body
+            });
+          } else {
+            await github.rest.issues.createComment({
+              owner,
+              repo,
+              issue_number,
+              body
+            });
+          }
 
     - name: Clean up artifacts
       if: always()
