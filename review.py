@@ -5,11 +5,11 @@ import requests
 import json
 from bs4 import BeautifulSoup
 from google import genai
-import fitz
+from google.genai import types
 import io
 import logging
 import re
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Union
 from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, Field
 
@@ -25,9 +25,63 @@ class SpecChecklist(BaseModel):
     items: list[ChecklistItem] = Field(description="List of checklist items derived from the specification.")
 
 # --- Helper Functions ---
-def analyze_specification(external_context: str, model_name: str) -> str:
+def get_document_content(urls_str: str) -> Tuple[List[Union[str, types.Part]], List[str]]:
+    """Fetches and extracts content from a comma-separated string of URLs. Returns Gemini Parts."""
+    if not urls_str:
+        logging.info("No external references provided.")
+        return [], []
+    
+    parts, errors = [], []
+    urls = [url.strip() for url in urls_str.split(',') if url.strip()]
+    logging.info(f"Fetching content from {len(urls)} external references...")
+    
+    for url in urls:
+        try:
+            logging.info(f"Processing URL: {url}")
+            # Handle GitHub URLs: convert to raw content if possible
+            processed_url = url
+            if "github.com" in url and "/blob/" in url:
+                processed_url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+                logging.info(f"Converted GitHub URL to raw: {processed_url}")
+
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            response = requests.get(processed_url, timeout=30, headers=headers)
+            response.raise_for_status()
+            content_type = response.headers.get("Content-Type", "")
+            
+            if "application/pdf" in content_type or url.lower().endswith('.pdf'):
+                # Use native PDF support
+                pdf_part = types.Part.from_bytes(
+                    data=response.content,
+                    mime_type="application/pdf"
+                )
+                parts.append(pdf_part)
+                logging.info(f"Added PDF part from: {url}")
+            elif "text/html" in content_type or url.lower().endswith(('.html', '.htm')):
+                # Parse HTML to extract readable text
+                soup = BeautifulSoup(response.content, "html.parser")
+                for element in soup(["script", "style", "nav", "footer", "header"]):
+                    element.decompose()
+                text = soup.get_text()
+                lines = (line.strip() for line in text.splitlines())
+                content = "\n".join(chunk for line in lines for chunk in line.split("  ") if chunk)
+                parts.append(f"--- Content from {url} ---\n{content}\n")
+                logging.info(f"Added parsed HTML part from: {url}")
+            else:
+                # Treat as plain text (markdown, lean, txt, raw github files, etc.)
+                # This preserves crucial whitespace and formatting
+                content = response.text
+                parts.append(f"--- Content from {url} ---\n{content}\n")
+                logging.info(f"Added plain text part from: {url}")
+        except Exception as e:
+            error_message = f"Error processing document '{url}': {e}"
+            logging.error(error_message)
+            errors.append(error_message)
+    return parts, errors
+
+def analyze_specification(external_parts: List[Union[str, types.Part]], model_name: str) -> str:
     """Agent A: Analyzes the external specification and generates a checklist."""
-    if not external_context.strip():
+    if not external_parts:
         return ""
     
     api_key = os.getenv("GEMINI_API_KEY")
@@ -45,20 +99,22 @@ def analyze_specification(external_context: str, model_name: str) -> str:
         logging.error(f"Error: Prompt template not found at {prompt_template_path}")
         return ""
 
-    prompt = prompt_template.replace("{{EXTERNAL_CONTEXT}}", external_context)
+    # Prepare multimodal contents
+    # We replace the placeholder with a simple label
+    prompt_text = prompt_template.replace("{{EXTERNAL_CONTEXT}}", "Please refer to the following external reference documents.")
+    contents = [prompt_text] + external_parts
     
     try:
         logging.info("Agent A (Spec Analyst) is generating the formalization checklist...")
         response = client.models.generate_content(
             model=model_name,
-            contents=prompt,
+            contents=contents,
             config={
                 'response_mime_type': 'application/json',
                 'response_schema': SpecChecklist,
             }
         )
         
-        # Parse the JSON response into a formatted markdown checklist
         data = json.loads(response.text)
         checklist_str = ""
         for item in data.get('items', []):
@@ -162,7 +218,7 @@ def split_diff_into_files(diff_content: str) -> Dict[str, str]:
             files[file_path] = file_diff
     return files
 
-def analyze_file_changes_with_context(review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str) -> str:
+def analyze_file_changes_with_context(review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str, external_parts: list) -> str:
     """Agent B (Code Reviewer): Generates a detailed code review for a single file using the specified Gemini model and the Checklist."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -191,18 +247,24 @@ def analyze_file_changes_with_context(review_context: dict, file_path: str, file
 ---
 """
 
-    prompt = prompt_template.replace("{{EXTERNAL_CONTEXT}}", review_context.get("external_context", "")) \
-                            .replace("{{SPEC_CHECKLIST}}", spec_checklist) \
+    prompt_text = prompt_template.replace("{{SPEC_CHECKLIST}}", spec_checklist) \
                             .replace("{{REPO_CONTEXT}}", review_context.get("repo_context", "")) \
                             .replace("{{FILE_PATH}}", file_path) \
                             .replace("{{FILE_DIFF}}", file_diff) \
                             .replace("{{FULL_CONTENT}}", full_content) \
                             .replace("{{ADDITIONAL_COMMENTS}}", additional_comments_section)
     
+    # Handle the fallback template which still has EXTERNAL_CONTEXT
+    if "{{EXTERNAL_CONTEXT}}" in prompt_text:
+        prompt_text = prompt_text.replace("{{EXTERNAL_CONTEXT}}", "Please refer to the following external reference documents.")
+        contents = [prompt_text] + external_parts
+    else:
+        contents = [prompt_text]
+
     try:
         logging.info(f"Agent B is reviewing file: {file_path}...")
         gemini_model = review_context.get("gemini_model")
-        response = client.models.generate_content(model=gemini_model, contents=prompt)
+        response = client.models.generate_content(model=gemini_model, contents=contents)
         return response.text
     except Exception as e:
         logging.error(f"Error during Gemini API call for {file_path}: {e}")
@@ -251,24 +313,22 @@ def main():
         print("Aborting review: Could not fetch PR diff. Errors:\n" + "\n".join(diff_errors))
         return
 
-    external_context, external_errors = get_document_content(args.external_refs)
+    external_parts, external_errors = get_document_content(args.external_refs)
     repo_context, repo_errors = get_repo_files_content(args.repo_context_refs)
 
-    all_errors = diff_errors + external_errors + repo_errors
+    all_errors = external_errors + repo_errors
     if all_errors:
-        error_section = "\n--- Errors Encountered During Context Fetching ---\n" + "\n".join(all_errors)
-        repo_context += error_section
         logging.warning("Encountered non-critical errors. Review will proceed with partial context.")
 
     review_context = {
-        "external_context": external_context,
+        "external_context": "[Multimodal Content Provided]",
         "repo_context": repo_context,
         "additional_comments": args.additional_comments,
         "gemini_model": args.gemini_model,
     }
     
     # --- Multi-Agent Orchestration Step 1: Spec Analysis ---
-    spec_checklist = analyze_specification(external_context, args.gemini_model)
+    spec_checklist = analyze_specification(external_parts, args.gemini_model)
     if spec_checklist:
         logging.info("Spec Analysis complete. Handing off checklist to Code Reviewers.")
     else:
@@ -290,7 +350,7 @@ def main():
                 logging.error(f"Error reading {file_path}: {e}")
         
         # --- Multi-Agent Orchestration Step 2: Code Review against Checklist ---
-        review_text = analyze_file_changes_with_context(review_context, file_path, file_diff, full_content, spec_checklist)
+        review_text = analyze_file_changes_with_context(review_context, file_path, file_diff, full_content, spec_checklist, external_parts)
         return file_path, review_text
 
     per_file_reviews = {}
