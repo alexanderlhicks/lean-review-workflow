@@ -145,39 +145,6 @@ def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
         errors.append(error_message)
         return "", errors
 
-def get_document_content(urls_str: str) -> Tuple[str, List[str]]:
-    """Fetches and extracts text content from a comma-separated string of URLs."""
-    if not urls_str:
-        logging.info("No external references provided.")
-        return "No external references were provided.", []
-    all_docs_content, errors = "", []
-    urls = [url.strip() for url in urls_str.split(',') if url.strip()]
-    logging.info(f"Fetching content from {len(urls)} external references...")
-    for url in urls:
-        try:
-            logging.info(f"Processing URL: {url}")
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, timeout=30, headers=headers)
-            response.raise_for_status()
-            content_type = response.headers.get("Content-Type", "")
-            content = ""
-            if "application/pdf" in content_type or url.lower().endswith('.pdf'):
-                with fitz.open(stream=io.BytesIO(response.content), filetype="pdf") as doc:
-                    content = "".join(page.get_text() for page in doc)
-            else:
-                soup = BeautifulSoup(response.content, "html.parser")
-                for element in soup(["script", "style", "nav", "footer", "header"]):
-                    element.decompose()
-                text = soup.get_text()
-                lines = (line.strip() for line in text.splitlines())
-                content = "\n".join(chunk for line in lines for chunk in line.split("  ") if chunk)
-            all_docs_content += f"--- Start of content from {url} ---\n{content}\n--- End of content from {url} ---\n\n"
-            logging.info(f"Successfully processed URL: {url}")
-        except Exception as e:
-            error_message = f"Error processing document '{url}': {e}"
-            logging.error(error_message)
-            errors.append(error_message)
-    return all_docs_content, errors
 
 def get_repo_files_content(paths_str: str) -> Tuple[str, List[str]]:
     """Reads content from a comma-separated string of file and directory paths."""
