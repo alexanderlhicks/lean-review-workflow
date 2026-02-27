@@ -305,7 +305,7 @@ def main():
     parser.add_argument("--external-refs", default="")
     parser.add_argument("--repo-context-refs", default="")
     parser.add_argument("--additional-comments", default="")
-    parser.add_argument("--gemini-model", default="gemini-2.0-flash")
+    parser.add_argument("--gemini-model", default="gemini-3.1-pro-preview")
     args = parser.parse_args()
 
     diff, diff_errors = get_pr_diff(args.pr_number)

@@ -8,78 +8,125 @@ This GitHub Action provides an advanced, AI-powered code review for Pull Request
     1.  **Specification Analyst (Agent A):** Reads external PDFs and math papers to extract a rigorous "Formalization Checklist" of concepts and edge cases that must be handled.
     2.  **Code Reviewer (Agent B):** Evaluates the Lean PR diffs and full file contents strictly against the formal checklist provided by Agent A, checking for universe errors, off-by-one errors, and misformalizations.
     3.  **Lead Synthesizer (Agent C):** Aggregates the findings into a clear, prioritized executive summary for the Pull Request.
+*   **Multimodal Specification Analysis:** Agent A uses Gemini's native PDF support to "read" mathematical formulas and diagrams directly from arXiv papers or textbook PDFs, ensuring high-fidelity extraction of mathematical intent.
 *   **Enhanced Lean Dependency Discovery:** Automatically identifies relevant Lean files impacted by a PR by leveraging `lake exe graph --json`. 
 *   **Parallel File Processing:** Reviews multiple files concurrently, drastically speeding up the review process for large pull requests.
 *   **Structured, File-by-File Review Output:** Provides an overall summary of the PR, followed by detailed and collapsible review sections for each individual Lean file changed.
 *   **Customizable AI Prompts:** The core instructions given to the AI are stored in external Markdown files (`prompts/`), allowing for easy customization of the agents' personas.
-*   **External Reference Integration:** Fetches and extracts content from external URLs (PDFs, HTML pages) to provide the AI with formal specifications or documentation for comparison against the PR's implementation.
-*   **Additional Repository Context:** Allows developers to explicitly provide paths to additional relevant files or directories within the repository (via `repo_context_refs`). This input can be dynamically generated (e.g., from a PR comment) to augment the AI's understanding with expert-selected or non-discoverable context.
-*   **Flexible Review Comments:** Supports additional, human-provided comments to guide the AI's focus during the review process.
-*   **Robust Error Handling:** Features enhanced error handling, logging, and graceful fallbacks for scenarios like failed dependency graph generation or inaccessible external references.
-*   **Configurable Gemini Model:** The specific Gemini model used for the review can be easily configured via action inputs.
+*   **GitHub Raw Support:** Automatically handles GitHub URLs for external references, fetching raw source code for the AI to analyze.
+*   **PR Hygiene:** Automatically updates existing AI review comments to keep the PR discussion thread clean and focused.
 
 ## How it Works
 
 1.  **Checkout Repository:** Fetches the full Git history of the repository.
 2.  **Set up Python & Lean:** Configures the environment with Python for the review script and Lean/Lake for building the project and generating dependency graphs.
-3.  **Install Python Dependencies:** Installs required Python libraries (e.g., `google-generativeai`, `requests`, `beautifulsoup4`, `PyMuPDF`).
+3.  **Install Python Dependencies:** Installs required Python libraries (e.g., `google-generativeai`, `requests`, `beautifulsoup4`, `pydantic`).
 4.  **Discover Related Files:**
     *   Identifies all `.lean` files changed in the pull request.
     *   Attempts to build the Lean project using `lake build`.
-    *   If successful, it runs `lake exe graph --json` to get the precise dependency graph.
-    *   Parses the graph to find:
-        *   All Lean modules that directly or transitively *depend on* the changed files (downstream dependencies).
-        *   All Lean modules that the changed files *directly depend on* (upstream dependencies).
-    *   If `lake build` or `lake graph` fails, it falls back to providing only the directly changed files as context.
-5.  **Run AI Review Script:** Executes `review.py` with all the gathered context (PR diff, external references, internal files, automatically discovered dependencies).
-6.  **Post Review Comment:** Publishes the AI-generated review as a comment on the Pull Request using `actions/github-script`, with retry logic for network resilience.
+    *   If successful, it runs `lake exe graph --json` to get the precise dependency graph (capped to top 15 dependencies for context efficiency).
+5.  **Run AI Review Script:** Executes `review.py` with the gathered context (Multimodal PR diff, external references, dependency content).
+6.  **Post Review Comment:** Publishes or updates the AI-generated review as a comment on the Pull Request.
 
 ## Usage
 
-This is a composite action intended to be used within your main repository workflow (e.g., in `.github/workflows/pr-review.yml`).
+This is a composite action. To unlock its full power (specifically the `external_refs` and `additional_comments` inputs), it is highly recommended to trigger this action via a **PR Comment (ChatOps)**.
+
+### Recommended: ChatOps Workflow (Dynamic PR Comments)
+
+Create a workflow file in your repository at `.github/workflows/ai-chatops.yml`:
+
+```yaml
+name: AI PR ChatOps
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  ai_review_chatops:
+    if: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '/review') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Parse Command
+        id: parse_command
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.comment.body;
+            let external_refs = "";
+            let additional_comments = "";
+            
+            const lines = body.split('\n');
+            for (const line of lines) {
+              if (line.startsWith('refs: ')) external_refs = line.replace('refs: ', '').trim();
+              if (line.startsWith('focus: ')) additional_comments = line.replace('focus: ', '').trim();
+            }
+            core.setOutput("external_refs", external_refs);
+            core.setOutput("additional_comments", additional_comments);
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run AI Code Review Action
+        uses: ./ # Or your-username/lean-review-workflow@main
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          pr_number: ${{ github.event.issue.number }}
+          external_refs: ${{ steps.parse_command.outputs.external_refs }}
+          additional_comments: ${{ steps.parse_command.outputs.additional_comments }}
+```
+
+**How developers use it:**
+Leave a comment on any PR:
+```text
+/review
+refs: https://arxiv.org/pdf/2301.12345.pdf
+focus: Check if my definition of a Perfectoid Space matches Section 4.
+```
+
+---
+
+### Alternative: Standard Push Workflow (Static)
 
 ```yaml
 name: AI Code Review for Lean PRs
 
 on:
   pull_request:
-    types: [opened, synchronize] # Trigger on PR open and new commits
+    types: [opened, synchronize]
 
 jobs:
   ai_review_lean:
     runs-on: ubuntu-latest
     permissions:
-      contents: read       # Required for actions/checkout
-      pull-requests: write # Required for actions/github-script to post comments
+      contents: read
+      pull-requests: write
 
     steps:
       - name: Run AI Code Review Action
-        uses: ./       # Refers to the current directory where action.yml resides
+        uses: ./ 
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           pr_number: ${{ github.event.pull_request.number }}
-          # Optional: Provide URLs to external formal specifications or documentation (can be dynamic, e.g., parsed from a PR comment)
-          external_refs: "https://example.com/spec.pdf, https://another.com/design.html"
-          # Optional: Provide paths to additional repository files or directories for context (can be dynamic, e.g., parsed from a PR comment)
-          repo_context_refs: "src/MyProject/FormalSpec.lean, src/MyProject/Types.lean, docs/architecture.md"
-          # Optional: Add specific instructions or focus areas for the AI reviewer (can be dynamic, e.g., parsed from a PR comment)
-          additional_comments: "Pay special attention to the proof completeness and adherence to the type class inference rules."
-          # Optional: Specify a different Gemini model (default is 'gemini-3-pro-preview')
-          gemini_model: "gemini-3-pro-preview"
-          # Optional: Whether to run the linter (default is 'false')
-          lint: "true"
+          gemini_model: "gemini-3.1-pro-preview"
 ```
 
 ### Inputs
 
-*   `github_token` (Required): GitHub Token for API calls. Use `${{ secrets.GITHUB_TOKEN }}`.
-*   `gemini_api_key` (Required): Gemini API Key for AI review generation. Store this as a repository secret.
-*   `pr_number` (Required): The Pull Request number. Use `${{ github.event.pull_request.number }}`.
-*   `external_refs` (Optional): Comma-separated list of URLs to external documents (PDFs, HTML) for contextual information.
-*   `repo_context_refs` (Optional): Comma-separated list of paths to relevant files or directories within the repository for additional context. Can be provided dynamically (e.g., from a PR comment).
-*   `additional_comments` (Optional): Extra comments or instructions for the AI reviewer.
-*   `gemini_model` (Optional): The specific Gemini model to use (default: `gemini-3-pro-preview`).
+*   `github_token` (Required): GitHub Token for API calls.
+*   `gemini_api_key` (Required): Gemini API Key for AI review generation.
+*   `pr_number` (Required): The Pull Request number.
+*   `external_refs` (Optional): Comma-separated list of URLs to external documents (PDFs, HTML, Raw Source).
+*   `repo_context_refs` (Optional): Comma-separated list of paths to additional internal context.
+*   `additional_comments` (Optional): Extra focus instructions for the AI reviewer.
+*   `gemini_model` (Optional): Default: `gemini-3.1-pro-preview`.
 *   `lint` (Optional): Whether to run the linter (default: `false`).
 
 ## Development

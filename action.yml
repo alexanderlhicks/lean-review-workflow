@@ -22,7 +22,7 @@ inputs:
   gemini_model:
     description: 'The Gemini model to use for AI review generation'
     required: false
-    default: 'gemini-2.0-flash'
+    default: 'gemini-3.1-pro-preview'
   lint:
     description: 'Whether to run the linter'
     required: false
