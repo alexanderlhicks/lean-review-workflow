@@ -72,6 +72,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh pr checkout ${{ github.event.issue.number }}
+
       - name: Run AI Code Review Action
         uses: ./ # Or your-username/lean-review-workflow@main
         with:

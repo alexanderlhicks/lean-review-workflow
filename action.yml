@@ -35,7 +35,7 @@ runs:
   using: "composite"
   steps:
     - name: Checkout repository
-      uses: actions/checkout@v6.0.1
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
 
@@ -64,121 +64,11 @@ runs:
 
     - name: Discover Related Files
       id: discover_files
-      shell: python
-      run: |
-        import subprocess
-        import json
-        import os
-        import sys
-
-        def get_changed_lean_files(base_ref, head_ref):
-            try:
-                command = f"git diff --name-only {base_ref} {head_ref}"
-                result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
-                changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip().endswith('.lean')]
-                return changed_files
-            except subprocess.CalledProcessError as e:
-                print(f"::error::Failed to get changed files: {e.stderr}")
-                return []
-
-        def get_lean_module_name(file_path):
-            # Assumes a standard Lean project structure, adjust if necessary
-            # e.g., src/My/Module.lean -> My.Module
-            if file_path.startswith("src/"):
-                file_path = file_path[4:]
-            elif file_path.startswith("Mathlib/"): # Common in mathlib projects
-                file_path = file_path[8:]
-            return file_path.replace('/', '.').replace('.lean', '')
-
-        def get_dependent_lean_files(changed_modules, lake_graph_json):
-            dependent_modules = set()
-            for module_info in lake_graph_json:
-                module_name = module_info['name']
-                if any(imp in changed_modules for imp in module_info.get('imports', [])) and module_name not in changed_modules:
-                    dependent_modules.add(module_name)
-            return list(dependent_modules)
-
-        def get_dependency_lean_files(changed_modules, lake_graph_json):
-            dependency_modules = set()
-            for module_info in lake_graph_json:
-                if module_info['name'] in changed_modules:
-                    dependency_modules.update(module_info.get('imports', []))
-            # We don't want to include dependencies that were also changed in the PR
-            return list(dependency_modules - changed_modules)
-
-        def convert_module_to_file_path(module_name):
-            # This needs to be robust enough for your project's structure.
-            # It might involve checking a `lean-toolchain` or `lake-manifest.json`
-            # for dependency paths. For now, we assume a simple structure.
-            # Example for a project with local files in 'src' and deps in 'lake-packages'
-            # This part might need significant adjustment for real-world complex projects.
-            parts = module_name.split('.')
-            # A simple heuristic: check for common library prefixes. This is not foolproof.
-            if module_name.startswith("Mathlib"):
-                return os.path.join('lake-packages', 'mathlib', 'Mathlib', *parts[1:]) + '.lean'
-            # Assume local files are in 'src'
-            return os.path.join('src', *parts) + '.lean'
-
-
-        base_ref = os.environ.get('GITHUB_BASE_REF')
-        if not base_ref:
-             base_ref = 'origin/main'
-        elif not base_ref.startswith('origin/'):
-             # Try to see if the ref exists, if not, prepend origin/
-             try:
-                 subprocess.run(f"git rev-parse --verify {base_ref}", shell=True, check=True, capture_output=True)
-             except subprocess.CalledProcessError:
-                 base_ref = f"origin/{base_ref}"
-
-        head_ref = os.environ.get('GITHUB_SHA', 'HEAD')
-
-        changed_files = get_changed_lean_files(base_ref, head_ref)
-        changed_modules = {get_lean_module_name(f) for f in changed_files}
-
-        all_relevant_files = set(changed_files)
-
-        try:
-            print("Attempting to generate Lake dependency graph...")
-            lake_graph_output = subprocess.run(
-                ['lake', 'exe', 'graph', '--json'],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=300
-            ).stdout
-            lake_graph_json = json.loads(lake_graph_output)
-            print("Successfully generated Lake dependency graph.")
-
-            # Find files that depend ON our changed files
-            dependent_modules = get_dependent_lean_files(changed_modules, lake_graph_json)
-            dependent_files = {convert_module_to_file_path(m) for m in dependent_modules}
-            all_relevant_files.update(dependent_files)
-
-            # Find files that our changed files depend ON
-            dependency_modules = get_dependency_lean_files(changed_modules, lake_graph_json)
-            dependency_files = {convert_module_to_file_path(m) for m in dependency_modules}
-            all_relevant_files.update(dependency_files)
-
-        except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
-            print(f"::warning::Could not generate or parse Lake graph for full dependency analysis: {e}")
-            print("::warning::Falling back to only changed files for context.")
-
-        final_file_list = sorted([f for f in all_relevant_files if os.path.exists(f)])
-        
-        # Limit the number of context files to 15 to avoid token bloat
-        CONTEXT_LIMIT = 15
-        if len(final_file_list) > CONTEXT_LIMIT:
-            print(f"::warning::Discovered {len(final_file_list)} files, capping context to {CONTEXT_LIMIT} most relevant.")
-            # Prioritize changed files, then dependencies
-            changed_first = [f for f in final_file_list if f in changed_files]
-            others = [f for f in final_file_list if f not in changed_files]
-            final_file_list = (changed_first + others)[:CONTEXT_LIMIT]
-
-        output_string = ','.join(final_file_list)
-
-        print(f"::notice::Discovered files for review: {output_string}")
-        with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-            f.write(f"discovered_files={output_string}\n")
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+      run: python ${{ github.action_path }}/discover_files.py
 
 
     - name: Run AI Review Script

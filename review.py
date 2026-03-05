@@ -79,16 +79,11 @@ def get_document_content(urls_str: str) -> Tuple[List[Union[str, types.Part]], L
             errors.append(error_message)
     return parts, errors
 
-def analyze_specification(external_parts: List[Union[str, types.Part]], model_name: str) -> str:
+def analyze_specification(client: genai.Client, external_parts: List[Union[str, types.Part]], cached_content_name: str, model_name: str) -> str:
     """Agent A: Analyzes the external specification and generates a checklist."""
-    if not external_parts:
+    if not external_parts and not cached_content_name:
         return ""
     
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key: 
-        return ""
-    
-    client = genai.Client(api_key=api_key)
     action_path = os.path.dirname(os.path.realpath(__file__))
     prompt_template_path = os.path.join(action_path, "prompts", "analyze_spec.md")
     
@@ -100,22 +95,34 @@ def analyze_specification(external_parts: List[Union[str, types.Part]], model_na
         return ""
 
     # Prepare multimodal contents
-    # We replace the placeholder with a simple label
     prompt_text = prompt_template.replace("{{EXTERNAL_CONTEXT}}", "Please refer to the following external reference documents.")
-    contents = [prompt_text] + external_parts
+    
+    config = {
+        'response_mime_type': 'application/json',
+        'response_schema': SpecChecklist,
+    }
+    
+    if cached_content_name:
+        contents = [prompt_text]
+        config['cached_content'] = cached_content_name
+    else:
+        contents = [prompt_text] + external_parts
     
     try:
         logging.info("Agent A (Spec Analyst) is generating the formalization checklist...")
         response = client.models.generate_content(
             model=model_name,
             contents=contents,
-            config={
-                'response_mime_type': 'application/json',
-                'response_schema': SpecChecklist,
-            }
+            config=config
         )
         
-        data = json.loads(response.text)
+        raw_text = response.text.strip()
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:-3].strip()
+        elif raw_text.startswith("```"):
+            raw_text = raw_text[3:-3].strip()
+            
+        data = json.loads(raw_text)
         checklist_str = ""
         for item in data.get('items', []):
             checklist_str += f"- **{item.get('concept')}**\n"
@@ -158,7 +165,7 @@ def get_repo_files_content(paths_str: str) -> Tuple[str, List[str]]:
     for path in paths:
         if os.path.isdir(path):
             for root, _, files in os.walk(path):
-                expanded_files.extend([os.path.join(root, name) for name in files])
+                expanded_files.extend([os.path.join(root, name) for name in files if name.endswith(('.lean', '.md'))])
         elif os.path.isfile(path):
             expanded_files.append(path)
         else:
@@ -179,20 +186,14 @@ def split_diff_into_files(diff_content: str) -> Dict[str, str]:
     for file_diff in file_diffs:
         if not file_diff.strip():
             continue
-        match = re.search(r'diff --git a/(.+) b/(.+)', file_diff)
+        match = re.search(r'diff --git a/(.*?) b/(.*?)\n', file_diff)
         if match:
             file_path = match.group(2)
             files[file_path] = file_diff
     return files
 
-def analyze_file_changes_with_context(review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str, external_parts: list) -> str:
+def analyze_file_changes_with_context(client: genai.Client, review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str, external_parts: list, cached_content_name: str) -> str:
     """Agent B (Code Reviewer): Generates a detailed code review for a single file using the specified Gemini model and the Checklist."""
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
-        return "Error: GEMINI_API_KEY not set."
-
-    client = genai.Client(api_key=api_key)
-
     action_path = os.path.dirname(os.path.realpath(__file__))
     
     # Select the appropriate prompt depending on if we have a checklist from Agent A
@@ -221,23 +222,35 @@ def analyze_file_changes_with_context(review_context: dict, file_path: str, file
                             .replace("{{FULL_CONTENT}}", full_content) \
                             .replace("{{ADDITIONAL_COMMENTS}}", additional_comments_section)
     
+    config = {}
     # Handle the fallback template which still has EXTERNAL_CONTEXT
     if "{{EXTERNAL_CONTEXT}}" in prompt_text:
         prompt_text = prompt_text.replace("{{EXTERNAL_CONTEXT}}", "Please refer to the following external reference documents.")
-        contents = [prompt_text] + external_parts
+        if cached_content_name:
+            contents = [prompt_text]
+            config['cached_content'] = cached_content_name
+        else:
+            # Fallback: strip raw PDF types.Part to avoid rate limit/redundant API costs
+            filtered_parts = [p for p in external_parts if isinstance(p, str)]
+            contents = [prompt_text] + filtered_parts
     else:
         contents = [prompt_text]
 
     try:
         logging.info(f"Agent B is reviewing file: {file_path}...")
         gemini_model = review_context.get("gemini_model")
-        response = client.models.generate_content(model=gemini_model, contents=contents)
+        
+        if config:
+            response = client.models.generate_content(model=gemini_model, contents=contents, config=config)
+        else:
+            response = client.models.generate_content(model=gemini_model, contents=contents)
+            
         return response.text
     except Exception as e:
         logging.error(f"Error during Gemini API call for {file_path}: {e}")
         return f"An error occurred while analyzing `{file_path}`: {e}"
 
-def synthesize_overall_summary(per_file_reviews: Dict[str, str], model_name: str) -> str:
+def synthesize_overall_summary(client: genai.Client, per_file_reviews: Dict[str, str], model_name: str) -> str:
     """Generates a high-level summary from all per-file reviews."""
     if not per_file_reviews:
         return "No files were reviewed."
@@ -255,9 +268,6 @@ def synthesize_overall_summary(per_file_reviews: Dict[str, str], model_name: str
 
     prompt = prompt_template.replace("{{PER_FILE_REVIEWS}}", formatted_reviews)
 
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key: return "Error: GEMINI_API_KEY not set."
-    client = genai.Client(api_key=api_key)
     try:
         logging.info("Synthesizing overall summary...")
         response = client.models.generate_content(model=model_name, contents=prompt)
@@ -280,12 +290,40 @@ def main():
         print("Aborting review: Could not fetch PR diff. Errors:\n" + "\n".join(diff_errors))
         return
 
+    diff_by_file = split_diff_into_files(diff)
+    if not diff_by_file:
+        print("### 🤖 AI Review\n\nNo Lean files were changed in this PR.")
+        return
+
     external_parts, external_errors = get_document_content(args.external_refs)
     repo_context, repo_errors = get_repo_files_content(args.repo_context_refs)
 
     all_errors = external_errors + repo_errors
     if all_errors:
         logging.warning("Encountered non-critical errors. Review will proceed with partial context.")
+
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        print("Error: GEMINI_API_KEY not set.")
+        return
+    client = genai.Client(api_key=api_key)
+
+    cached_content_name = None
+    if external_parts:
+        try:
+            logging.info("Attempting to create context cache for external references...")
+            cache = client.caches.create(
+                model=args.gemini_model,
+                config=types.CreateCachedContentConfig(
+                    contents=external_parts,
+                    ttl="3600s",
+                    display_name="External Context Cache"
+                )
+            )
+            cached_content_name = cache.name
+            logging.info(f"Successfully created context cache: {cached_content_name}")
+        except Exception as e:
+            logging.warning(f"Could not create context cache (falling back): {e}")
 
     review_context = {
         "external_context": "[Multimodal Content Provided]",
@@ -295,14 +333,12 @@ def main():
     }
     
     # --- Multi-Agent Orchestration Step 1: Spec Analysis ---
-    spec_checklist = analyze_specification(external_parts, args.gemini_model)
+    spec_checklist = analyze_specification(client, external_parts, cached_content_name, args.gemini_model)
     if spec_checklist:
         logging.info("Spec Analysis complete. Handing off checklist to Code Reviewers.")
     else:
         logging.info("No external specification provided or analysis failed. Proceeding with standard review.")
 
-    diff_by_file = split_diff_into_files(diff)
-    
     def process_file(file_path, file_diff):
         if not file_path.endswith(".lean"):
             logging.info(f"Skipping non-Lean file: {file_path}")
@@ -317,7 +353,7 @@ def main():
                 logging.error(f"Error reading {file_path}: {e}")
         
         # --- Multi-Agent Orchestration Step 2: Code Review against Checklist ---
-        review_text = analyze_file_changes_with_context(review_context, file_path, file_diff, full_content, spec_checklist, external_parts)
+        review_text = analyze_file_changes_with_context(client, review_context, file_path, file_diff, full_content, spec_checklist, external_parts, cached_content_name)
         return file_path, review_text
 
     per_file_reviews = {}
@@ -327,7 +363,14 @@ def main():
             if file_path:
                 per_file_reviews[file_path] = review_text
     
-    overall_summary = synthesize_overall_summary(per_file_reviews, args.gemini_model)
+    overall_summary = synthesize_overall_summary(client, per_file_reviews, args.gemini_model)
+
+    if cached_content_name:
+        try:
+            client.caches.delete(name=cached_content_name)
+            logging.info("Cleaned up context cache.")
+        except Exception as e:
+            logging.warning(f"Failed to delete context cache: {e}")
 
     # Format the final comment for printing to stdout
     final_comment = f"### 🤖 AI Review\n\n**Overall Summary:**\n{overall_summary}\n\n---\n"
