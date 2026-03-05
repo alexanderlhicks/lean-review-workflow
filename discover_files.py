@@ -5,8 +5,7 @@ import sys
 
 def get_changed_lean_files(pr_number):
     try:
-        command = f"gh pr diff {pr_number} --name-only"
-        result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+        result = subprocess.run(["gh", "pr", "diff", str(pr_number), "--name-only"], check=True, capture_output=True, text=True)
         changed_files = [f.strip() for f in result.stdout.splitlines() if f.strip().endswith('.lean')]
         return changed_files
     except subprocess.CalledProcessError as e:
@@ -16,10 +15,15 @@ def get_changed_lean_files(pr_number):
 def get_lean_module_name(file_path):
     # Assumes a standard Lean project structure, adjust if necessary
     # e.g., src/My/Module.lean -> My.Module
-    if file_path.startswith("src/"):
+    src_dir = os.environ.get('LEAN_SRC_DIR')
+    if src_dir and file_path.startswith(f"{src_dir}/"):
+        file_path = file_path[len(src_dir)+1:]
+    elif file_path.startswith("src/"):
         file_path = file_path[4:]
     elif file_path.startswith("Mathlib/"): # Common in mathlib projects
         file_path = file_path[8:]
+    elif file_path.startswith("lib/"):
+        file_path = file_path[4:]
     return file_path.replace('/', '.').replace('.lean', '')
 
 def get_dependent_lean_files(changed_modules, lake_graph_json):
@@ -99,8 +103,12 @@ def main():
 
     final_file_list = sorted([f for f in all_relevant_files if os.path.exists(f)])
     
-    # Limit the number of context files to 15 to avoid token bloat
-    CONTEXT_LIMIT = 15
+    # Limit the number of context files to avoid token bloat
+    try:
+        CONTEXT_LIMIT = int(os.environ.get('CONTEXT_LIMIT', 15))
+    except ValueError:
+        CONTEXT_LIMIT = 15
+
     if len(final_file_list) > CONTEXT_LIMIT:
         print(f"::warning::Discovered {len(final_file_list)} files, capping context to {CONTEXT_LIMIT} most relevant.")
         # Prioritize changed files, then dependencies

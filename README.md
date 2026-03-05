@@ -46,6 +46,7 @@ jobs:
   ai_review_chatops:
     if: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '/review') }}
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write
@@ -109,6 +110,7 @@ on:
 jobs:
   ai_review_lean:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     permissions:
       contents: read
       pull-requests: write
@@ -120,8 +122,7 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           pr_number: ${{ github.event.pull_request.number }}
-          gemini_model: "gemini-3.1-pro-preview"
-```
+          gemini_model: "gemini-2.5-pro"
 
 ### Inputs
 
@@ -131,7 +132,7 @@ jobs:
 *   `external_refs` (Optional): Comma-separated list of URLs to external documents (PDFs, HTML, Raw Source).
 *   `repo_context_refs` (Optional): Comma-separated list of paths to additional internal context.
 *   `additional_comments` (Optional): Extra focus instructions for the AI reviewer.
-*   `gemini_model` (Optional): Default: `gemini-3.1-pro-preview`.
+*   `gemini_model` (Optional): Default: `gemini-2.5-pro`.
 *   `lint` (Optional): Whether to run the linter (default: `false`).
 
 ## Development

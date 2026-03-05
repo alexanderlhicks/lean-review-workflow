@@ -35,7 +35,7 @@ runs:
   using: "composite"
   steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
+      uses: actions/checkout@v6.0.2
       with:
         fetch-depth: 0
 
@@ -44,14 +44,14 @@ runs:
       shell: bash
 
     - name: Set up Python
-      uses: actions/setup-python@v6.1.0
+      uses: actions/setup-python@v6.2.0
       with:
         python-version: '3.13'
         cache: 'pip'
         cache-dependency-path: ./action-requirements.txt
 
     - name: Set up Lean and Build
-      uses: leanprover/lean-action@v1.3.0
+      uses: leanprover/lean-action@v1.4.0
       with:
         build: true
         test: false
@@ -79,10 +79,20 @@ runs:
         GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
         PR_NUMBER: ${{ inputs.pr_number }}
         EXTERNAL_REFS: ${{ inputs.external_refs }}
-        REPO_CONTEXT_REFS: ${{ inputs.repo_context_refs }},${{ steps.discover_files.outputs.discovered_files }}
+        REPO_CONTEXT_REFS_INPUT: ${{ inputs.repo_context_refs }}
+        DISCOVERED_FILES: ${{ steps.discover_files.outputs.discovered_files }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
         GEMINI_MODEL: ${{ inputs.gemini_model }}
       run: |
+        # Construct REPO_CONTEXT_REFS safely to avoid leading comma
+        if [ -n "$REPO_CONTEXT_REFS_INPUT" ] && [ -n "$DISCOVERED_FILES" ]; then
+          REPO_CONTEXT_REFS="$REPO_CONTEXT_REFS_INPUT,$DISCOVERED_FILES"
+        elif [ -n "$REPO_CONTEXT_REFS_INPUT" ]; then
+          REPO_CONTEXT_REFS="$REPO_CONTEXT_REFS_INPUT"
+        else
+          REPO_CONTEXT_REFS="$DISCOVERED_FILES"
+        fi
+
         # Run the script and capture its output to post as a comment later
         # We use a special "end of file" marker to handle multiline output
         EOF_MARKER=$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16)
@@ -137,4 +147,4 @@ runs:
       if: always()
       shell: bash
       run: |
-        rm ./action-requirements.txt
+        rm -f ./action-requirements.txt
