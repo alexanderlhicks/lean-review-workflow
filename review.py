@@ -10,17 +10,20 @@ from google import genai
 from google.genai import types
 import logging
 import re
-from typing import Tuple, List, Dict, Union
+from typing import Tuple, List, Dict, Union, Literal
 from concurrent.futures import ThreadPoolExecutor
 from pydantic import BaseModel, Field
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+ACTION_PATH = os.path.dirname(os.path.realpath(__file__))
+
 # --- Pydantic Schemas for Multi-Agent Orchestration ---
 class ChecklistItem(BaseModel):
     concept: str = Field(description="The mathematical concept or theorem name.")
     verification_steps: list[str] = Field(description="List of specific things to check for to avoid misformalization.")
+    severity: Literal["Critical", "Major", "Minor"] = Field(description="Severity of this item: 'Critical', 'Major', or 'Minor'")
 
 class SpecChecklist(BaseModel):
     items: list[ChecklistItem] = Field(description="List of checklist items derived from the specification.")
@@ -94,13 +97,12 @@ def get_document_content(urls_str: str) -> Tuple[List[Union[str, types.Part]], L
             errors.append(error_message)
     return parts, errors
 
-def analyze_specification(client: genai.Client, external_parts: List[Union[str, types.Part]], cached_content_name: str, model_name: str) -> str:
+def analyze_specification(client: genai.Client, external_parts: List[Union[str, types.Part]], cached_content_name: str, model_name: str, all_diffs: str) -> str:
     """Agent A: Analyzes the external specification and generates a checklist."""
     if not external_parts and not cached_content_name:
         return ""
     
-    action_path = os.path.dirname(os.path.realpath(__file__))
-    prompt_template_path = os.path.join(action_path, "prompts", "analyze_spec.md")
+    prompt_template_path = os.path.join(ACTION_PATH, "prompts", "analyze_spec.md")
     
     try:
         with open(prompt_template_path, "r") as f:
@@ -110,7 +112,8 @@ def analyze_specification(client: genai.Client, external_parts: List[Union[str, 
         return ""
 
     # Prepare multimodal contents
-    prompt_text = prompt_template.replace("{{EXTERNAL_CONTEXT}}", "Please refer to the following external reference documents.")
+    prompt_text = prompt_template.replace("{{EXTERNAL_CONTEXT}}", "Please refer to the following external reference documents.") \
+                                 .replace("{{FILE_DIFFS}}", all_diffs)
     
     config = {
         'response_mime_type': 'application/json',
@@ -136,7 +139,7 @@ def analyze_specification(client: genai.Client, external_parts: List[Union[str, 
         checklist_str = ""
         if checklist:
             for item in checklist.items:
-                checklist_str += f"- **{item.concept}**\n"
+                checklist_str += f"- **{item.concept}** [{item.severity}]\n"
                 for step in item.verification_steps:
                     checklist_str += f"  - [ ] {step}\n"
         
@@ -203,13 +206,12 @@ def split_diff_into_files(diff_content: str) -> Dict[str, str]:
             files[file_path] = file_diff
     return files
 
-def analyze_file_changes_with_context(client: genai.Client, review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str, external_parts: list, cached_content_name: str) -> str:
+def analyze_file_changes_with_context(client: genai.Client, review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str, external_parts: list, cached_content_name: str, lean4_checklist: str, verdict_rules: str) -> str:
     """Agent B (Code Reviewer): Generates a detailed code review for a single file using the specified Gemini model and the Checklist."""
-    action_path = os.path.dirname(os.path.realpath(__file__))
     
     # Select the appropriate prompt depending on if we have a checklist from Agent A
     prompt_file = "review_code_with_spec.md" if spec_checklist else "review_file.md"
-    prompt_template_path = os.path.join(action_path, "prompts", prompt_file)
+    prompt_template_path = os.path.join(ACTION_PATH, "prompts", prompt_file)
 
     try:
         with open(prompt_template_path, "r") as f:
@@ -231,7 +233,9 @@ def analyze_file_changes_with_context(client: genai.Client, review_context: dict
                             .replace("{{FILE_PATH}}", file_path) \
                             .replace("{{FILE_DIFF}}", file_diff) \
                             .replace("{{FULL_CONTENT}}", full_content) \
-                            .replace("{{ADDITIONAL_COMMENTS}}", additional_comments_section)
+                            .replace("{{ADDITIONAL_COMMENTS}}", additional_comments_section) \
+                            .replace("{{LEAN4_CHECKLIST}}", lean4_checklist) \
+                            .replace("{{VERDICT_RULES}}", verdict_rules)
     
     config = {}
     # Handle the fallback template which still has EXTERNAL_CONTEXT
@@ -261,15 +265,14 @@ def analyze_file_changes_with_context(client: genai.Client, review_context: dict
         logging.error(f"Error during Gemini API call for {file_path}: {e}")
         return f"An error occurred while analyzing `{file_path}`: {e}"
 
-def synthesize_overall_summary(client: genai.Client, per_file_reviews: Dict[str, str], spec_checklist: str, model_name: str) -> str:
+def synthesize_overall_summary(client: genai.Client, per_file_reviews: Dict[str, str], spec_checklist: str, verdict_rules: str, model_name: str) -> str:
     """Generates a high-level summary from all per-file reviews."""
     if not per_file_reviews:
         return "No files were reviewed."
     
     formatted_reviews = "\n\n".join(f"### Review for `{file_path}`:\n{review_text}" for file_path, review_text in per_file_reviews.items())
     
-    action_path = os.path.dirname(os.path.realpath(__file__))
-    prompt_template_path = os.path.join(action_path, "prompts", "synthesize_summary.md")
+    prompt_template_path = os.path.join(ACTION_PATH, "prompts", "synthesize_summary.md")
 
     try:
         with open(prompt_template_path, "r") as f:
@@ -277,7 +280,7 @@ def synthesize_overall_summary(client: genai.Client, per_file_reviews: Dict[str,
     except FileNotFoundError:
         return f"Error: Prompt template not found at {prompt_template_path}"
 
-    prompt = prompt_template.replace("{{PER_FILE_REVIEWS}}", formatted_reviews).replace("{{SPEC_CHECKLIST}}", spec_checklist or "No explicit checklist provided.")
+    prompt = prompt_template.replace("{{PER_FILE_REVIEWS}}", formatted_reviews).replace("{{SPEC_CHECKLIST}}", spec_checklist or "No explicit checklist provided.").replace("{{VERDICT_RULES}}", verdict_rules)
 
     try:
         logging.info("Synthesizing overall summary...")
@@ -344,8 +347,26 @@ def main():
             "gemini_model": args.gemini_model,
         }
         
+        lean4_checklist_path = os.path.join(ACTION_PATH, "prompts", "lean4_checklist.md")
+        try:
+            with open(lean4_checklist_path, "r") as f:
+                lean4_checklist = f.read()
+        except FileNotFoundError:
+            logging.error(f"Error: lean4_checklist.md not found at {lean4_checklist_path}")
+            sys.exit(1)
+
+        verdict_rules_path = os.path.join(ACTION_PATH, "prompts", "verdict_rules.md")
+        try:
+            with open(verdict_rules_path, "r") as f:
+                verdict_rules = f.read()
+        except FileNotFoundError:
+            logging.error(f"Error: verdict_rules.md not found at {verdict_rules_path}")
+            sys.exit(1)
+
+        all_diffs = "\n".join([f"--- {f} ---\n{d}" for f, d in diff_by_file.items()])
+        
         # --- Multi-Agent Orchestration Step 1: Spec Analysis ---
-        spec_checklist = analyze_specification(client, external_parts, cached_content_name, args.gemini_model)
+        spec_checklist = analyze_specification(client, external_parts, cached_content_name, args.gemini_model, all_diffs)
         if spec_checklist:
             logging.info("Spec Analysis complete. Handing off checklist to Code Reviewers.")
         else:
@@ -365,7 +386,7 @@ def main():
                     logging.error(f"Error reading {file_path}: {e}")
             
             # --- Multi-Agent Orchestration Step 2: Code Review against Checklist ---
-            review_text = analyze_file_changes_with_context(client, review_ctx, file_path, file_diff, full_content, spec_checklist, external_parts, cached_content_name)
+            review_text = analyze_file_changes_with_context(client, review_ctx, file_path, file_diff, full_content, spec_checklist, external_parts, cached_content_name, lean4_checklist, verdict_rules)
             return file_path, review_text
 
         per_file_reviews = {}
@@ -375,7 +396,7 @@ def main():
                 if file_path:
                     per_file_reviews[file_path] = review_text
         
-        overall_summary = synthesize_overall_summary(client, per_file_reviews, spec_checklist, args.gemini_model)
+        overall_summary = synthesize_overall_summary(client, per_file_reviews, spec_checklist, verdict_rules, args.gemini_model)
 
         # Format the final comment for printing to stdout
         final_comment = f"### 🤖 AI Review\n\n**Overall Summary:**\n{overall_summary}\n\n---\n"
