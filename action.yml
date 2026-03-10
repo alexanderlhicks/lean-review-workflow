@@ -109,10 +109,17 @@ runs:
       uses: actions/github-script@v8
       env:
         REVIEW_TEXT: ${{ steps.run_review.outputs.review_text }}
+        EXTERNAL_REFS: ${{ inputs.external_refs }}
+        REPO_CONTEXT_REFS: ${{ inputs.repo_context_refs }}
+        ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
       with:
         retries: 3
         script: |
-          const header = '### 🤖 AI Review (with external context)\n\n';
+          let headerText = '### 🤖 Initial AI review without external context';
+          if (process.env.EXTERNAL_REFS || process.env.REPO_CONTEXT_REFS || process.env.ADDITIONAL_COMMENTS) {
+            headerText = '### 🤖 AI Review (with external context)';
+          }
+          const header = headerText + '\n\n';
           const body = header + process.env.REVIEW_TEXT;
           const { owner, repo } = context.repo;
           const issue_number = context.issue.number;
@@ -124,7 +131,7 @@ runs:
           });
 
           const botComment = comments.data.find(comment => 
-            comment.user.type === 'Bot' && comment.body.includes('### 🤖 AI Review')
+            comment.user.type === 'Bot' && (comment.body.includes('### 🤖 AI Review') || comment.body.includes('### 🤖 Initial AI review'))
           );
 
           if (botComment) {
