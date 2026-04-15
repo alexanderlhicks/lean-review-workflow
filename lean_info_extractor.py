@@ -297,7 +297,9 @@ def main():
         import random, string
         eof_marker = 'EOF_LEAN_' + ''.join(random.choices(string.ascii_uppercase + string.digits, k=12))
         with open(github_output, 'a') as f:
-            f.write(f"lean_info_json={json_output}\n")
+            f.write(f"lean_info_json<<{eof_marker}_JSON\n")
+            f.write(json_output + "\n")
+            f.write(f"{eof_marker}_JSON\n")
             f.write(f"lean_info_formatted<<{eof_marker}\n")
             f.write(formatted_output + "\n")
             f.write(f"{eof_marker}\n")

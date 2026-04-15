@@ -177,7 +177,8 @@ runs:
             headerText = '### 🤖 AI Review (with external context)';
           }
           const header = headerText + '\n\n';
-          const body = header + process.env.REVIEW_TEXT;
+          const reviewText = process.env.REVIEW_TEXT || '';
+          const body = reviewText.startsWith('### 🤖 ') ? reviewText : header + reviewText;
           const { owner, repo } = context.repo;
           const pr_number = parseInt(process.env.PR_NUMBER);
 

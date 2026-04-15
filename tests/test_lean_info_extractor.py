@@ -12,6 +12,7 @@ from lean_info_extractor import (
     extract_sorry_warnings,
     extract_light_info,
     format_for_review,
+    main,
 )
 from lean_utils import file_path_to_module_name
 
@@ -157,3 +158,22 @@ class TestExtractLightInfo:
     def test_handles_nonexistent(self):
         result = extract_light_info(["/nonexistent/file.lean"])
         assert result["files_scanned"] == 0
+
+
+class TestGitHubOutputFormatting:
+    def test_multiline_outputs_use_heredoc_syntax(self, tmp_path, monkeypatch, capsys):
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text("theorem foo : True := sorry\n")
+        github_output = tmp_path / "github_output.txt"
+
+        monkeypatch.setenv("CHANGED_FILES", str(lean_file))
+        monkeypatch.setenv("GITHUB_OUTPUT", str(github_output))
+        monkeypatch.delenv("SUMMARY_FILES", raising=False)
+        monkeypatch.setattr(sys, "argv", ["lean_info_extractor.py"])
+
+        main()
+
+        output_text = github_output.read_text()
+        assert "lean_info_json<<" in output_text
+        assert "lean_info_formatted<<" in output_text
+        assert '"sorry_locations": [' in output_text

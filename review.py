@@ -4,13 +4,14 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Literal, Tuple, Union
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -154,6 +155,7 @@ def _validate_url(url: str) -> Tuple[bool, str]:
         hostname = parsed.hostname
         if not hostname:
             return False, "No hostname in URL"
+        hostname = hostname.lower()
         # Check for obvious private/dangerous hostnames
         if hostname in ('localhost', '127.0.0.1', '::1', '0.0.0.0'):
             return False, f"Blocked localhost URL: {hostname}"
@@ -166,9 +168,58 @@ def _validate_url(url: str) -> Tuple[bool, str]:
             # hostname is a domain name, not an IP — check for metadata endpoints
             if hostname.endswith('.internal') or hostname == 'metadata.google.internal':
                 return False, f"Blocked internal hostname: {hostname}"
+            try:
+                resolved = {
+                    addr_info[4][0]
+                    for addr_info in socket.getaddrinfo(hostname, None)
+                    if addr_info[4]
+                }
+            except socket.gaierror as e:
+                return False, f"Hostname resolution failed for {hostname}: {e}"
+            if not resolved:
+                return False, f"No IP addresses resolved for hostname: {hostname}"
+            for resolved_ip in resolved:
+                ip = ipaddress.ip_address(resolved_ip)
+                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                    return False, f"Blocked private/reserved IP via DNS resolution: {resolved_ip}"
         return True, ""
     except Exception as e:
         return False, f"URL validation error: {e}"
+
+
+def _normalize_external_url(url: str) -> str:
+    """Normalizes supported external reference URLs before fetching."""
+    processed_url = url
+    if "github.com" in url and "/blob/" in url:
+        processed_url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+        logging.info(f"Converted GitHub URL to raw: {processed_url}")
+    return processed_url
+
+
+def _fetch_url_content(url: str, timeout: int = 30, max_redirects: int = 5) -> Tuple[requests.Response, str]:
+    """Fetches a URL while validating every hop to prevent SSRF via redirects."""
+    headers = {'User-Agent': 'Mozilla/5.0'}
+    current_url = url
+    visited = set()
+    session = requests.Session()
+
+    for _ in range(max_redirects + 1):
+        is_safe, reason = _validate_url(current_url)
+        if not is_safe:
+            raise ValueError(f"Blocked unsafe URL '{current_url}': {reason}")
+        if current_url in visited:
+            raise ValueError(f"Redirect loop detected while fetching '{url}'")
+        visited.add(current_url)
+
+        response = session.get(current_url, timeout=timeout, headers=headers, allow_redirects=False)
+        if 300 <= response.status_code < 400 and response.headers.get("Location"):
+            current_url = urljoin(current_url, response.headers["Location"])
+            continue
+
+        response.raise_for_status()
+        return response, current_url
+
+    raise requests.TooManyRedirects(f"Too many redirects while fetching '{url}'")
 
 
 def get_document_content(urls_str: str) -> Tuple[List[ContentPart], List[str]]:
@@ -184,27 +235,14 @@ def get_document_content(urls_str: str) -> Tuple[List[ContentPart], List[str]]:
     for url in urls:
         try:
             logging.info(f"Processing URL: {url}")
-            processed_url = url
-            if "github.com" in url and "/blob/" in url:
-                processed_url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
-                logging.info(f"Converted GitHub URL to raw: {processed_url}")
-
-            is_safe, reason = _validate_url(processed_url)
-            if not is_safe:
-                error_message = f"Blocked unsafe URL '{url}': {reason}"
-                logging.warning(error_message)
-                errors.append(error_message)
-                continue
-
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(processed_url, timeout=30, headers=headers)
-            response.raise_for_status()
+            processed_url = _normalize_external_url(url)
+            response, final_url = _fetch_url_content(processed_url, timeout=30)
             content_type = response.headers.get("Content-Type", "")
 
-            if "application/pdf" in content_type or url.lower().endswith('.pdf'):
+            if "application/pdf" in content_type or final_url.lower().endswith('.pdf'):
                 parts.append(ContentPart(type="pdf", data=response.content, mime_type="application/pdf"))
                 logging.info(f"Added PDF part from: {url}")
-            elif "text/html" in content_type or url.lower().endswith(('.html', '.htm')):
+            elif "text/html" in content_type or final_url.lower().endswith(('.html', '.htm')):
                 soup = BeautifulSoup(response.content, "html.parser")
                 for element in soup(["script", "style", "nav", "footer", "header"]):
                     element.decompose()
@@ -933,7 +971,8 @@ def main():
         sys.exit(1)
 
     diff_by_file = split_diff_into_files(diff)
-    if not diff_by_file:
+    lean_files = {f: d for f, d in diff_by_file.items() if f.endswith('.lean')}
+    if not lean_files:
         print("### 🤖 AI Review\n\nNo Lean files were changed in this PR.")
         return
 
@@ -1041,7 +1080,6 @@ def main():
             logging.info("No external specification provided or analysis failed. Proceeding with standard review.")
 
         # --- Multi-Agent Orchestration Step 1.5: Triage ---
-        lean_files = {f: d for f, d in diff_by_file.items() if f.endswith('.lean')}
         if len(lean_files) > 2:
             clusters = run_triage(provider, lean_files, spec_checklist, args.additional_comments, args.triage_model)
         elif len(lean_files) == 2:

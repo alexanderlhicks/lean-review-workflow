@@ -3,13 +3,16 @@
 import pytest
 import sys
 import os
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from review import (
     split_diff_into_files,
     _extract_added_lines,
+    _fetch_url_content,
     _is_in_string,
+    _normalize_external_url,
     run_mechanical_prechecks,
     _get_diff_lines,
     _load_prompt,
@@ -256,11 +259,19 @@ class TestLoadPrompt:
 # --- URL Validation ---
 
 class TestValidateUrl:
-    def test_valid_https(self):
+    def test_valid_https(self, monkeypatch):
+        monkeypatch.setattr(
+            "review.socket.getaddrinfo",
+            lambda host, port: [(None, None, None, None, ("93.184.216.34", 0))]
+        )
         is_safe, _ = _validate_url("https://arxiv.org/pdf/2301.12345.pdf")
         assert is_safe is True
 
-    def test_valid_http(self):
+    def test_valid_http(self, monkeypatch):
+        monkeypatch.setattr(
+            "review.socket.getaddrinfo",
+            lambda host, port: [(None, None, None, None, ("93.184.216.34", 0))]
+        )
         is_safe, _ = _validate_url("http://example.com/file.pdf")
         assert is_safe is True
 
@@ -290,6 +301,44 @@ class TestValidateUrl:
     def test_no_hostname(self):
         is_safe, reason = _validate_url("http://")
         assert is_safe is False
+
+    def test_blocked_private_ip_via_dns_resolution(self, monkeypatch):
+        monkeypatch.setattr(
+            "review.socket.getaddrinfo",
+            lambda host, port: [(None, None, None, None, ("169.254.169.254", 0))]
+        )
+        is_safe, reason = _validate_url("https://example.com/spec.pdf")
+        assert is_safe is False
+        assert "dns" in reason.lower() or "private" in reason.lower()
+
+
+class TestExternalFetch:
+    def test_normalize_github_blob_url(self):
+        result = _normalize_external_url("https://github.com/org/repo/blob/main/Foo.lean")
+        assert result == "https://raw.githubusercontent.com/org/repo/main/Foo.lean"
+
+    def test_redirect_revalidated_before_following(self, monkeypatch):
+        monkeypatch.setattr(
+            "review.socket.getaddrinfo",
+            lambda host, port: [(None, None, None, None, ("93.184.216.34", 0))]
+            if host == "example.com"
+            else [(None, None, None, None, ("169.254.169.254", 0))]
+        )
+
+        class FakeSession:
+            def get(self, url, timeout, headers, allow_redirects):
+                if url == "https://example.com/start":
+                    return SimpleNamespace(
+                        status_code=302,
+                        headers={"Location": "http://metadata.google.internal/secret"},
+                        raise_for_status=lambda: None,
+                    )
+                raise AssertionError(f"Unexpected fetch: {url}")
+
+        monkeypatch.setattr("review.requests.Session", lambda: FakeSession())
+
+        with pytest.raises(ValueError, match="Blocked unsafe URL"):
+            _fetch_url_content("https://example.com/start")
 
 
 # --- Retry Logic ---
@@ -448,3 +497,20 @@ class TestStructuredSynthesisInput:
         json_str = json.dumps(structured, indent=2)
         parsed = json.loads(json_str)
         assert parsed["Foo.lean"]["critical_count"] == 1
+
+
+class TestMainFlow:
+    def test_main_exits_early_when_no_lean_files_changed(self, monkeypatch, capsys):
+        import review
+
+        monkeypatch.setattr(review, "get_pr_diff", lambda pr_number: ("diff --git a/README.md b/README.md\n", []))
+
+        def fail_create_provider(*args, **kwargs):
+            raise AssertionError("Provider setup should not run for non-Lean PRs")
+
+        monkeypatch.setattr(review, "create_provider", fail_create_provider)
+        monkeypatch.setattr(sys, "argv", ["review.py", "--pr-number", "123"])
+
+        review.main()
+        output = capsys.readouterr().out
+        assert "No Lean files were changed in this PR." in output
