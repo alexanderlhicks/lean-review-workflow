@@ -1,22 +1,24 @@
 # AI Code Review Workflow for Lean Projects
 
-This GitHub Action provides an AI-powered code review for Pull Requests in Lean 4 projects, with a strong focus on detecting misformalization issues. It leverages the Gemini API to analyze code changes against formal specifications and project dependencies through a multi-agent pipeline.
+This GitHub Action provides an AI-powered code review for Pull Requests in Lean 4 projects, with a strong focus on detecting misformalization issues. It supports multiple LLM providers (Gemini, Anthropic Claude, OpenAI GPT) and analyzes code changes against formal specifications and project dependencies through a multi-agent pipeline.
 
 ## Features
 
 *   **5-Agent Review Pipeline:**
     1.  **Mechanical Pre-Checks:** Deterministic scanning for escape hatches (`sorry`, `axiom`, `native_decide`, `opaque`, `implemented_by`, `sorryAx`) in both newly introduced and pre-existing code, with comment- and string-awareness (including Lean 4 nested block comments).
-    2.  **Specification Analyst (Agent A):** Reads external PDFs and math papers using Gemini's native multimodal support to extract a "Formalization Checklist" — a mapping from paper results to mathematical content that any correct formalization must preserve.
-    3.  **Triage Agent:** Groups changed files into review clusters based on the dependency graph and type signatures, prioritizing tightly-coupled files for joint review.
-    4.  **Code Reviewer (Agent B):** Evaluates each Lean file's diff and full content against the spec checklist, repository context, and Lean 4 best practices. Runs in parallel across files (up to 5 concurrent workers) with cluster-level context for cross-file type awareness.
+    2.  **Specification Analyst (Agent A):** Reads external PDFs and math papers (native multimodal for Gemini/Anthropic; text extraction via pymupdf for OpenAI) to extract a "Formalization Checklist" — a mapping from paper results to mathematical content that any correct formalization must preserve. Receives repository structure and dependency graph for awareness of existing formalizations.
+    3.  **Triage Agent:** Groups changed files into review clusters based on the dependency graph and type signatures, prioritizing tightly-coupled files for joint review. Produces a **review strategy** and **key hypotheses** per cluster that guide the per-file reviewers.
+    4.  **Code Reviewer (Agent B):** Evaluates each Lean file's diff and full content against the spec checklist, repository context, and Lean 4 best practices. Writes a structured **analysis** before producing findings (what the code does mathematically, risk assessment, spec mapping). Runs in parallel across files (up to 5 concurrent workers) with cluster-level type signatures, review strategy, and key hypotheses.
     5.  **Cross-File Analysis Agent:** Analyzes composition chains, type-flow across files, axiom/escape-hatch impact propagation, and external dependency correctness.
     6.  **Lead Synthesizer (Agent C):** Aggregates per-file reviews (both formatted and structured data) into a prioritized executive summary with deduplication.
 *   **Transitive Dependency Discovery:** Uses `lake exe graph --json` with BFS traversal (configurable depth, default 2) to find both direct and transitive dependencies. Asymmetric depth: dependencies (what we import) go to depth 2; dependents (what imports us) stay at depth 1.
 *   **Lean Toolchain Extraction:** Post-build extraction of axiom dependencies (`#print axioms`), `sorry`/`admit` locations, and compiler diagnostics for all changed files, plus lightweight sorry/admit scanning for overflow files.
 *   **Tiered Context Management:** Full file content for up to 50 files (configurable via `CONTEXT_LIMIT`), with type-signature-only summaries for overflow files. Depth-1 dependencies are prioritized over depth-2 in the full-context tier.
-*   **Context Completeness Guarantees:** External reference fetch errors, Lean toolchain extraction failures, and context cache failures are surfaced as warnings in the review output. External references fall back to inline delivery if Gemini caching fails.
+*   **Context Completeness Guarantees:** External reference fetch errors, Lean toolchain extraction failures, and content cache failures are surfaced as warnings in the review output. External references fall back to inline delivery if caching fails.
+*   **Agent Deliberation:** Agents think before reviewing. Extended thinking (configurable token budget) gives the model internal reasoning time. FileReview and CrossFileAnalysis schemas include an `analysis` field where the model writes its step-by-step reasoning before committing to findings. Triage produces per-cluster review strategies and testable hypotheses that flow to the per-file reviewers.
+*   **Multi-Provider Support:** Supports Gemini, Anthropic (Claude), and OpenAI (GPT) as interchangeable backends via a provider abstraction layer. Each provider handles structured output, PDF content, caching, and extended thinking according to its native API.
 *   **Structured Output:** All agents produce Pydantic-validated JSON responses. Line-level annotations are posted via the GitHub Review API using the modern `line`/`side` parameters.
-*   **Per-Agent Model Selection:** Each pipeline stage can use a different Gemini model via CLI flags (`--spec-model`, `--review-model`, `--cross-file-model`, `--synthesis-model`).
+*   **Per-Agent Model Selection:** Each pipeline stage can use a different model via CLI flags (`--spec-model`, `--review-model`, `--cross-file-model`, `--synthesis-model`).
 *   **Adaptive Pipeline:** Single-file PRs skip triage, cross-file analysis, and synthesis (the per-file review is the output, with a deterministic downstream impact note from the dependency graph). Two-file PRs skip triage but get cross-file analysis.
 
 ## How it Works
@@ -28,10 +30,10 @@ This GitHub Action provides an AI-powered code review for Pull Requests in Lean 
 5.  **Run Multi-Agent Review Pipeline:**
     *   **Pre-checks** (deterministic): Scans diffs for escape hatches with nested block comment and string literal awareness.
     *   **Agent A** (spec analysis): Reads external PDFs/papers with repository structure context, produces a formalization checklist.
-    *   **Triage**: Groups files into review clusters using dependency graph and type signatures.
-    *   **Agent B** (per-file review, parallel): Reviews each file against the spec checklist, repo context, cluster file signatures, and Lean 4 best practices.
-    *   **Cross-File Agent**: Analyzes composition chains, type-flow, and axiom impact across all changed files.
-    *   **Synthesis**: Aggregates structured review data and formatted reviews into an executive summary.
+    *   **Triage**: Groups files into review clusters using dependency graph and type signatures. Produces review strategies and key hypotheses per cluster.
+    *   **Agent B** (per-file review, parallel): Writes a step-by-step analysis of each file, then derives findings from the analysis. Receives cluster review strategy, key hypotheses, and type signatures of related files.
+    *   **Cross-File Agent**: Traces composition chains, type-flow, and axiom propagation, then reports issues grounded in that analysis.
+    *   **Synthesis**: Aggregates structured review data (finding counts, verdicts, violated checklist items) and formatted reviews into an executive summary.
 6.  **Post Review:** Publishes or updates an AI review comment on the PR, with collapsible per-file details grouped by cluster. Line-level annotations are posted as GitHub Review comments where findings map to diff lines.
 
 ## Usage
