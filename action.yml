@@ -38,6 +38,21 @@ inputs:
     description: 'Thinking token budget for deep-analysis agents (spec, per-file review, cross-file). Triage and synthesis use 1/5 of this.'
     required: false
     default: '10240'
+  spec_model:
+    description: 'Model override for the Specification Analyst agent. Falls back to model.'
+    required: false
+  triage_model:
+    description: 'Model override for the Triage agent. Falls back to model.'
+    required: false
+  review_model:
+    description: 'Model override for the per-file Code Reviewer agent. Falls back to model.'
+    required: false
+  cross_file_model:
+    description: 'Model override for the Cross-File Analysis agent. Falls back to model.'
+    required: false
+  synthesis_model:
+    description: 'Model override for the Synthesis agent. Falls back to model.'
+    required: false
 outputs:
   review_text:
     description: "The generated review text"
@@ -111,6 +126,11 @@ runs:
         LEAN_INFO: ${{ steps.lean_info.outputs.lean_info_formatted }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
         THINKING_BUDGET: ${{ inputs.thinking_budget }}
+        SPEC_MODEL: ${{ inputs.spec_model }}
+        TRIAGE_MODEL: ${{ inputs.triage_model }}
+        REVIEW_MODEL: ${{ inputs.review_model }}
+        CROSS_FILE_MODEL: ${{ inputs.cross_file_model }}
+        SYNTHESIS_MODEL: ${{ inputs.synthesis_model }}
       run: |
         # Construct REPO_CONTEXT_REFS safely to avoid leading comma
         if [ -n "$REPO_CONTEXT_REFS_INPUT" ] && [ -n "$DISCOVERED_FILES" ]; then
@@ -132,7 +152,12 @@ runs:
           --additional-comments "$ADDITIONAL_COMMENTS" \
           --provider "$PROVIDER" \
           --model "$MODEL" \
-          --thinking-budget "$THINKING_BUDGET" >> $GITHUB_OUTPUT
+          --thinking-budget "$THINKING_BUDGET" \
+          ${SPEC_MODEL:+--spec-model "$SPEC_MODEL"} \
+          ${TRIAGE_MODEL:+--triage-model "$TRIAGE_MODEL"} \
+          ${REVIEW_MODEL:+--review-model "$REVIEW_MODEL"} \
+          ${CROSS_FILE_MODEL:+--cross-file-model "$CROSS_FILE_MODEL"} \
+          ${SYNTHESIS_MODEL:+--synthesis-model "$SYNTHESIS_MODEL"} >> $GITHUB_OUTPUT
         echo "$EOF_MARKER" >> $GITHUB_OUTPUT
 
     - name: Post Review

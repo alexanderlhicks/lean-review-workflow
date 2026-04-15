@@ -289,6 +289,8 @@ class AnthropicProvider(LLMProvider):
         if hasattr(response, 'usage'):
             usage.input_tokens = getattr(response.usage, 'input_tokens', 0) or 0
             usage.output_tokens = getattr(response.usage, 'output_tokens', 0) or 0
+            # Anthropic reports thinking tokens via cache_creation_input_tokens when thinking is enabled
+            usage.thinking_tokens = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
 
         return parsed, usage
 

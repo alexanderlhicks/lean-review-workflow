@@ -9,6 +9,7 @@ This provides ground-truth information that complements LLM-based review.
 """
 
 import json
+import logging
 import os
 import re
 import subprocess

@@ -5,7 +5,7 @@ You are the first step in a multi-agent review pipeline. Your output must be a r
 **External References:**
 ---
 {{EXTERNAL_CONTEXT}}
-<!-- Note: If using the default Python script, the actual multimodal PDF/image content will be injected *after* this text prompt as native Gemini API parts. -->
+<!-- Note: Multimodal PDF/image content is injected after this text prompt as provider-native content parts. -->
 ---
 
 **PR Diff (Context for Scoping):**

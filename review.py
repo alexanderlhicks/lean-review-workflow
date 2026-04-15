@@ -906,6 +906,7 @@ def main():
     parser.add_argument("--provider", default="gemini", help="LLM provider: gemini, anthropic, or openai")
     parser.add_argument("--model", default="", help="Default model for all agents")
     parser.add_argument("--spec-model", default="", help="Model for Agent A (spec analysis). Falls back to --model")
+    parser.add_argument("--triage-model", default="", help="Model for Triage agent. Falls back to --model")
     parser.add_argument("--review-model", default="", help="Model for Agent B (per-file review). Falls back to --model")
     parser.add_argument("--cross-file-model", default="", help="Model for cross-file analysis. Falls back to --model")
     parser.add_argument("--synthesis-model", default="", help="Model for synthesis. Falls back to --model")
@@ -914,8 +915,9 @@ def main():
 
     # Resolve per-agent models (fall back to default)
     if not args.model:
-        args.model = os.environ.get("MODEL", "gemini-2.5-pro")
+        args.model = os.environ.get("MODEL", "")
     args.spec_model = args.spec_model or args.model
+    args.triage_model = args.triage_model or args.model
     args.review_model = args.review_model or args.model
     args.cross_file_model = args.cross_file_model or args.model
     args.synthesis_model = args.synthesis_model or args.model
@@ -964,9 +966,19 @@ def main():
     if all_errors:
         logging.warning("Encountered non-critical errors. Review will proceed with partial context.")
 
-    api_key = os.getenv("API_KEY") or os.getenv("GEMINI_API_KEY")  # backwards compat
+    # Try generic API_KEY first, then provider-specific fallbacks
+    api_key = os.getenv("API_KEY")
     if not api_key:
-        logging.error("Error: API_KEY not set.")
+        provider_env_keys = {
+            "gemini": "GEMINI_API_KEY",
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai": "OPENAI_API_KEY",
+        }
+        fallback_key = provider_env_keys.get(args.provider.lower(), "")
+        if fallback_key:
+            api_key = os.getenv(fallback_key)
+    if not api_key:
+        logging.error(f"Error: API_KEY not set. Set API_KEY or the provider-specific key for '{args.provider}'.")
         sys.exit(1)
 
     provider = create_provider(args.provider, api_key)
@@ -1030,9 +1042,8 @@ def main():
 
         # --- Multi-Agent Orchestration Step 1.5: Triage ---
         lean_files = {f: d for f, d in diff_by_file.items() if f.endswith('.lean')}
-        is_small_pr = len(lean_files) <= 2
         if len(lean_files) > 2:
-            clusters = run_triage(provider, lean_files, spec_checklist, args.additional_comments, args.model)
+            clusters = run_triage(provider, lean_files, spec_checklist, args.additional_comments, args.triage_model)
         elif len(lean_files) == 2:
             # Two files: single cluster without the overhead of triage
             files = list(lean_files.keys())

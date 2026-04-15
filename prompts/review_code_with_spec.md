@@ -43,7 +43,10 @@ Focus *only* on the changes presented in the diff for `{{FILE_PATH}}`, using the
 
     **Proof Strategy Check (when spec checklist is available):**
     Beyond the statement, check whether the proof *strategy* is consistent with the paper's argument. A theorem that is provable by `omega` (linear arithmetic) when the paper requires algebraic reasoning may indicate the statement is accidentally weaker than intended. A proof that relies on `Classical.choice` where the paper's argument is constructive may indicate a missing `Decidable` instance. Flag such mismatches — they are not necessarily wrong, but warrant reviewer attention.
-    
+
+    **Missing Formalization Check:**
+    Review the Reference Mapping Table from the Specification Checklist. If any paper results are marked as "Missing" (the paper defines or proves something that has no corresponding Lean formalization in this PR), flag this as a critical finding if the PR's scope suggests it should have been included. If the missing result is a prerequisite for what the PR does formalize, note the gap explicitly.
+
 2.  **Lean 4 & Mathlib Best Practices:**
     Critically assess the Lean implementation against standard practices:
 {{LEAN4_CHECKLIST}}
