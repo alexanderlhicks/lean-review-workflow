@@ -3,6 +3,9 @@ import json
 import os
 import sys
 
+from lean_utils import file_path_to_module_name
+
+
 def get_changed_lean_files(pr_number):
     try:
         result = subprocess.run(["gh", "pr", "diff", str(pr_number), "--name-only"], check=True, capture_output=True, text=True)
@@ -12,19 +15,10 @@ def get_changed_lean_files(pr_number):
         print(f"::error::Failed to get changed files: {e.stderr}")
         return []
 
+
 def get_lean_module_name(file_path):
-    # Assumes a standard Lean project structure, adjust if necessary
-    # e.g., src/My/Module.lean -> My.Module
-    src_dir = os.environ.get('LEAN_SRC_DIR')
-    if src_dir and file_path.startswith(f"{src_dir}/"):
-        file_path = file_path[len(src_dir)+1:]
-    elif file_path.startswith("src/"):
-        file_path = file_path[4:]
-    elif file_path.startswith("Mathlib/"): # Common in mathlib projects
-        file_path = file_path[8:]
-    elif file_path.startswith("lib/"):
-        file_path = file_path[4:]
-    return file_path.replace('/', '.').replace('.lean', '')
+    """Converts a file path to a Lean module name."""
+    return file_path_to_module_name(file_path)
 
 def get_dependent_lean_files(changed_modules, lake_graph_json):
     dependent_modules = set()
@@ -35,12 +29,42 @@ def get_dependent_lean_files(changed_modules, lake_graph_json):
     return list(dependent_modules)
 
 def get_dependency_lean_files(changed_modules, lake_graph_json):
+    """Returns direct dependencies only (depth 1). Use get_transitive_dependencies for deeper traversal."""
     dependency_modules = set()
     for module_info in lake_graph_json:
         if module_info['name'] in changed_modules:
             dependency_modules.update(module_info.get('imports', []))
-    # We don't want to include dependencies that were also changed in the PR
     return list(dependency_modules - changed_modules)
+
+
+def get_transitive_dependencies(changed_modules, lake_graph_json, max_depth=2):
+    """BFS to find transitive dependencies (what changed files import, recursively).
+    Returns dict mapping module_name -> depth (1 = direct import, 2 = import-of-import, etc.)."""
+    import_map = {m['name']: set(m.get('imports', [])) for m in lake_graph_json}
+
+    visited = {}  # module -> depth
+    frontier = set()
+
+    # Seed: direct imports of changed files (depth 1)
+    for module in changed_modules:
+        for imp in import_map.get(module, []):
+            if imp not in changed_modules:
+                frontier.add(imp)
+                visited[imp] = 1
+
+    # BFS for depth 2..max_depth
+    for depth in range(2, max_depth + 1):
+        next_frontier = set()
+        for module in frontier:
+            for imp in import_map.get(module, []):
+                if imp not in changed_modules and imp not in visited:
+                    visited[imp] = depth
+                    next_frontier.add(imp)
+        frontier = next_frontier
+        if not frontier:
+            break
+
+    return visited
 
 def build_lean_file_index():
     index = []
@@ -72,6 +96,8 @@ def main():
     changed_modules = {get_lean_module_name(f) for f in changed_files}
 
     all_relevant_files = set(changed_files)
+    lake_graph_json = []
+    dep_files_with_depth = {}  # file_path -> depth (for priority ordering)
 
     try:
         print("Attempting to generate Lake dependency graph...")
@@ -87,40 +113,68 @@ def main():
 
         lean_files_index = build_lean_file_index()
 
-        # Find files that depend ON our changed files
+        # Find files that depend ON our changed files (depth 1 only — deeper fans out too fast)
         dependent_modules = get_dependent_lean_files(changed_modules, lake_graph_json)
         dependent_files = {convert_module_to_file_path(m, lean_files_index) for m in dependent_modules}
         all_relevant_files.update(dependent_files)
 
-        # Find files that our changed files depend ON
-        dependency_modules = get_dependency_lean_files(changed_modules, lake_graph_json)
-        dependency_files = {convert_module_to_file_path(m, lean_files_index) for m in dependency_modules}
-        all_relevant_files.update(dependency_files)
+        # Find transitive dependencies (what our files import, recursively)
+        try:
+            dep_depth = int(os.environ.get('DEPENDENCY_DEPTH', '2'))
+        except ValueError:
+            dep_depth = 2
+        dep_with_depth = get_transitive_dependencies(changed_modules, lake_graph_json, max_depth=dep_depth)
+        dep_files_with_depth = {}  # file_path -> depth
+        for module, depth in dep_with_depth.items():
+            fp = convert_module_to_file_path(module, lean_files_index)
+            dep_files_with_depth[fp] = depth
+        all_relevant_files.update(dep_files_with_depth.keys())
 
     except (subprocess.CalledProcessError, json.JSONDecodeError, FileNotFoundError) as e:
         print(f"::warning::Could not generate or parse Lake graph for full dependency analysis: {e}")
         print("::warning::Falling back to only changed files for context.")
 
     final_file_list = sorted([f for f in all_relevant_files if os.path.exists(f)])
-    
-    # Limit the number of context files to avoid token bloat
+
+    # Limit the number of full-context files
     try:
-        CONTEXT_LIMIT = int(os.environ.get('CONTEXT_LIMIT', 15))
+        CONTEXT_LIMIT = int(os.environ.get('CONTEXT_LIMIT', 50))
     except ValueError:
-        CONTEXT_LIMIT = 15
+        CONTEXT_LIMIT = 50
 
-    if len(final_file_list) > CONTEXT_LIMIT:
-        print(f"::warning::Discovered {len(final_file_list)} files, capping context to {CONTEXT_LIMIT} most relevant.")
-        # Prioritize changed files, then dependencies
-        changed_first = [f for f in final_file_list if f in changed_files]
-        others = [f for f in final_file_list if f not in changed_files]
-        final_file_list = (changed_first + others)[:CONTEXT_LIMIT]
+    # Separate into full-context and summary-context tiers with depth-based priority
+    changed_first = [f for f in final_file_list if f in changed_files]
+    others = [f for f in final_file_list if f not in changed_files]
 
-    output_string = ','.join(final_file_list)
+    # Sort others: depth-1 (direct dependents + direct deps) before depth-2+ (transitive)
+    def _file_priority(fp):
+        return dep_files_with_depth.get(fp, 1)  # dependents (not in dep map) default to depth 1
+    others.sort(key=_file_priority)
+
+    full_context_files = changed_first + others[:max(0, CONTEXT_LIMIT - len(changed_first))]
+    summary_context_files = others[max(0, CONTEXT_LIMIT - len(changed_first)):]
+
+    if summary_context_files:
+        print(f"::notice::Discovered {len(final_file_list)} files. {len(full_context_files)} with full context, {len(summary_context_files)} with summary context (type signatures only).")
+
+    output_string = ','.join(full_context_files)
+    summary_string = ','.join(summary_context_files)
 
     print(f"::notice::Discovered files for review: {output_string}")
+    if summary_string:
+        print(f"::notice::Summary-context files: {summary_string}")
+
+    # Serialize lake graph for downstream steps (avoids re-running lake exe graph)
+    lake_graph_serialized = ""
+    try:
+        lake_graph_serialized = json.dumps(lake_graph_json)
+    except Exception:
+        pass
+
     with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
         f.write(f"discovered_files={output_string}\n")
+        f.write(f"summary_files={summary_string}\n")
+        f.write(f"lake_graph={lake_graph_serialized}\n")
 
 if __name__ == "__main__":
     main()

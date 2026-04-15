@@ -5,7 +5,7 @@ You are the first step in a multi-agent review pipeline. Your output must be a r
 **External References:**
 ---
 {{EXTERNAL_CONTEXT}}
-<!-- Note: If using the default Python script, the actual multimodal PDF/image content will be injected *after* this text prompt as native Gemini API parts. -->
+<!-- Note: Multimodal PDF/image content is injected after this text prompt as provider-native content parts. -->
 ---
 
 **PR Diff (Context for Scoping):**
@@ -13,14 +13,35 @@ You are the first step in a multi-agent review pipeline. Your output must be a r
 {{FILE_DIFFS}}
 ---
 
+**Repository Structure (type signatures of related files):**
+---
+{{REPO_STRUCTURE}}
+---
+
+**Dependency Graph:**
+---
+{{DEPENDENCY_GRAPH}}
+---
+
 **Your Task:**
-Identify the key mathematical concepts in the text and translate them into a checklist for a Lean formalizer. 
+Your primary job is to read the external references (papers) **first**, extract the mathematical results, and then check whether the PR diff formalizes them correctly. Work paper → Lean, not diff → paper.
 
 Mathematicians frequently omit "obvious" details in prose that are absolutely critical for Lean. You must read between the lines and explicitly identify these hidden mathematical nuances.
 
-**Scope Constraint:** You have been provided the PR diff. Focus your checklist *only* on concepts that are directly relevant to the definitions, lemmas, or theorems appearing in the diff. If a concept appears in the references but no definition, lemma, or theorem involving it is added or modified in the diff, omit it from the checklist entirely. Do not generate an exhaustive checklist of the entire paper.
+**Step 1 — Reference Mapping Table:**
+For each theorem, lemma, definition, or protocol step in the paper that is relevant to this PR, produce a mapping entry:
+- **Paper Result:** The theorem/definition as stated in the paper (section number, statement in mathematical notation)
+- **Mathematical Content:** The precise mathematical content that any correct formalization must preserve — enumerate the hypotheses (including implicit ones), the conclusion, and the specific mathematical objects involved (domains, codomains, fields, metrics, error bounds). Do NOT predict the Lean syntax; describe the mathematics.
+- **Status:** Whether the diff appears to contain a corresponding formalization, is missing it, or partially covers it
 
-For each concept you identify, provide a severity tag ('Critical', 'Major', or 'Minor') and a list of specific, actionable verification steps. Pay special attention to:
+This catches the critical case where a paper result is **absent** from the diff, not just different.
+
+**Step 2 — Formalization Checklist:**
+For each concept relevant to the PR, provide a severity tag ('Critical', 'Major', or 'Minor') and a list of specific, actionable verification steps.
+
+**Scope Constraint:** Focus on concepts relevant to the definitions, lemmas, or theorems appearing in the diff, but also flag paper results that *should* be in the diff but are missing. Do not generate an exhaustive checklist of the entire paper — only results that this PR is attempting to formalize or that are prerequisites for what it formalizes.
+
+Pay special attention to:
 1.  **Hidden Assumptions:** Does the text assume a set is non-empty, finite, or countably infinite without saying so? Does it assume a space is Hausdorff, a ring is commutative, or a function is continuous?
 2.  **Implicit Identifications (Coercions):** Does the text implicitly treat a subgroup as a group, or an integer as a real number? These require explicit coercions or subspace types in Lean.
 3.  **Boundary Conditions & Edge Cases:** What happens at zero, infinity, the empty set, or trivial cases?
