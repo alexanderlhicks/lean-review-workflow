@@ -14,10 +14,12 @@ from review import (
     _get_diff_lines,
     _load_prompt,
     _validate_url,
-    _is_retryable,
-    _is_rate_limit,
 )
 from lean_utils import is_in_comment
+from llm_provider import (
+    ContentPart, TokenUsage, _is_retryable_generic, _is_rate_limit_generic,
+    create_provider, extract_pdf_text,
+)
 
 
 # --- split_diff_into_files ---
@@ -295,21 +297,21 @@ class TestValidateUrl:
 class TestRetryLogic:
     def test_rate_limit_is_retryable(self):
         error = Exception("429 Resource has been exhausted")
-        assert _is_retryable(error) is True
-        assert _is_rate_limit(error) is True
+        assert _is_retryable_generic(error) is True
+        assert _is_rate_limit_generic(error) is True
 
     def test_server_error_is_retryable(self):
         error = Exception("500 Internal Server Error")
-        assert _is_retryable(error) is True
-        assert _is_rate_limit(error) is False
+        assert _is_retryable_generic(error) is True
+        assert _is_rate_limit_generic(error) is False
 
     def test_auth_error_not_retryable(self):
         error = Exception("403 Permission denied")
-        assert _is_retryable(error) is False
+        assert _is_retryable_generic(error) is False
 
     def test_invalid_request_not_retryable(self):
         error = Exception("400 Invalid request")
-        assert _is_retryable(error) is False
+        assert _is_retryable_generic(error) is False
 
 
 # --- Pydantic Schema Tests ---

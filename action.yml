@@ -4,9 +4,13 @@ inputs:
   github_token:
     description: 'GitHub Token for API calls'
     required: true
-  gemini_api_key:
-    description: 'Gemini API Key for AI review generation'
+  api_key:
+    description: 'API key for the LLM provider'
     required: true
+  provider:
+    description: 'LLM provider to use: gemini, anthropic, or openai'
+    required: false
+    default: 'gemini'
   pr_number:
     description: 'The Pull Request number'
     required: true
@@ -19,10 +23,9 @@ inputs:
   additional_comments:
     description: 'Additional comments for the review'
     required: false
-  gemini_model:
-    description: 'The Gemini model to use for AI review generation'
-    required: false
-    default: 'gemini-2.5-pro'
+  model:
+    description: 'The LLM model to use (e.g., gemini-2.5-pro, claude-sonnet-4-20250514, gpt-4o)'
+    required: true
   lint:
     description: 'Whether to run the linter'
     required: false
@@ -96,7 +99,9 @@ runs:
       id: run_review
       env:
         GITHUB_TOKEN: ${{ inputs.github_token }}
-        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
+        API_KEY: ${{ inputs.api_key }}
+        PROVIDER: ${{ inputs.provider }}
+        MODEL: ${{ inputs.model }}
         PR_NUMBER: ${{ inputs.pr_number }}
         EXTERNAL_REFS: ${{ inputs.external_refs }}
         REPO_CONTEXT_REFS_INPUT: ${{ inputs.repo_context_refs }}
@@ -105,7 +110,6 @@ runs:
         LAKE_GRAPH: ${{ steps.discover_files.outputs.lake_graph }}
         LEAN_INFO: ${{ steps.lean_info.outputs.lean_info_formatted }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
-        GEMINI_MODEL: ${{ inputs.gemini_model }}
         THINKING_BUDGET: ${{ inputs.thinking_budget }}
       run: |
         # Construct REPO_CONTEXT_REFS safely to avoid leading comma
@@ -126,7 +130,8 @@ runs:
           --external-refs "$EXTERNAL_REFS" \
           --repo-context-refs "$REPO_CONTEXT_REFS" \
           --additional-comments "$ADDITIONAL_COMMENTS" \
-          --gemini-model "$GEMINI_MODEL" \
+          --provider "$PROVIDER" \
+          --model "$MODEL" \
           --thinking-budget "$THINKING_BUDGET" >> $GITHUB_OUTPUT
         echo "$EOF_MARKER" >> $GITHUB_OUTPUT
 

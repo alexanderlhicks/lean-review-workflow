@@ -14,11 +14,10 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from google import genai
-from google.genai import types
 from pydantic import BaseModel, Field
 
 from lean_utils import is_in_comment, FileCache, file_path_to_module_name
+from llm_provider import LLMProvider, ContentPart, TokenUsage, create_provider
 
 # --- Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -100,18 +99,13 @@ class TokenTracker:
         self.total_thinking_tokens = 0
         self.call_count = 0
 
-    def record(self, response):
-        """Records token usage from a Gemini API response."""
+    def record(self, usage: TokenUsage):
+        """Records token usage from a provider response."""
         with self._lock:
             self.call_count += 1
-            try:
-                usage = response.usage_metadata
-                if usage:
-                    self.total_input_tokens += getattr(usage, 'prompt_token_count', 0) or 0
-                    self.total_output_tokens += getattr(usage, 'candidates_token_count', 0) or 0
-                    self.total_thinking_tokens += getattr(usage, 'thoughts_token_count', 0) or 0
-            except Exception:
-                pass
+            self.total_input_tokens += usage.input_tokens
+            self.total_output_tokens += usage.output_tokens
+            self.total_thinking_tokens += usage.thinking_tokens
 
     def summary(self) -> str:
         with self._lock:
@@ -150,48 +144,6 @@ def _load_prompt(template_name: str, replacements: Dict[str, str]) -> str:
     return result
 
 
-_api_semaphore = threading.Semaphore(3)  # max concurrent Gemini API calls
-
-
-def _is_retryable(error: Exception) -> bool:
-    """Check if an API error is retryable (rate limits, server errors)."""
-    error_str = str(error).lower()
-    if any(s in error_str for s in ['429', 'rate limit', 'resource_exhausted',
-                                     '500', '502', '503', '504', 'overloaded', 'capacity']):
-        return True
-    status = getattr(error, 'status_code', None) or getattr(error, 'code', None)
-    if isinstance(status, int) and (status >= 500 or status == 429):
-        return True
-    return False
-
-
-def _is_rate_limit(error: Exception) -> bool:
-    error_str = str(error).lower()
-    return '429' in error_str or 'rate limit' in error_str or 'resource_exhausted' in error_str
-
-
-def generate_with_retry(client: genai.Client, model: str, contents, config=None, max_retries=3):
-    """Wraps Gemini API calls with exponential backoff, rate limiting, and token tracking."""
-    with _api_semaphore:
-        for attempt in range(max_retries):
-            try:
-                if config:
-                    response = client.models.generate_content(model=model, contents=contents, config=config)
-                else:
-                    response = client.models.generate_content(model=model, contents=contents)
-                token_tracker.record(response)
-                return response
-            except Exception as e:
-                if attempt == max_retries - 1:
-                    raise
-                if not _is_retryable(e):
-                    raise  # non-retryable errors fail fast
-                wait_time = 2 ** (attempt + 1)
-                if _is_rate_limit(e):
-                    wait_time = max(wait_time, 15)
-                logging.warning(f"Retryable API error (attempt {attempt+1}/{max_retries}): {e}")
-                time.sleep(wait_time)
-
 def _validate_url(url: str) -> Tuple[bool, str]:
     """Validates a URL is safe to fetch (SSRF protection).
     Blocks private IPs, link-local, loopback, and non-HTTP(S) schemes."""
@@ -219,8 +171,8 @@ def _validate_url(url: str) -> Tuple[bool, str]:
         return False, f"URL validation error: {e}"
 
 
-def get_document_content(urls_str: str) -> Tuple[List[Union[str, types.Part]], List[str]]:
-    """Fetches and extracts content from a comma-separated string of URLs. Returns Gemini Parts."""
+def get_document_content(urls_str: str) -> Tuple[List[ContentPart], List[str]]:
+    """Fetches content from URLs and returns provider-agnostic ContentParts."""
     if not urls_str:
         logging.info("No external references provided.")
         return [], []
@@ -232,13 +184,11 @@ def get_document_content(urls_str: str) -> Tuple[List[Union[str, types.Part]], L
     for url in urls:
         try:
             logging.info(f"Processing URL: {url}")
-            # Handle GitHub URLs: convert to raw content if possible
             processed_url = url
             if "github.com" in url and "/blob/" in url:
                 processed_url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
                 logging.info(f"Converted GitHub URL to raw: {processed_url}")
 
-            # SSRF protection
             is_safe, reason = _validate_url(processed_url)
             if not is_safe:
                 error_message = f"Blocked unsafe URL '{url}': {reason}"
@@ -250,30 +200,22 @@ def get_document_content(urls_str: str) -> Tuple[List[Union[str, types.Part]], L
             response = requests.get(processed_url, timeout=30, headers=headers)
             response.raise_for_status()
             content_type = response.headers.get("Content-Type", "")
-            
+
             if "application/pdf" in content_type or url.lower().endswith('.pdf'):
-                # Use native PDF support
-                pdf_part = types.Part.from_bytes(
-                    data=response.content,
-                    mime_type="application/pdf"
-                )
-                parts.append(pdf_part)
+                parts.append(ContentPart(type="pdf", data=response.content, mime_type="application/pdf"))
                 logging.info(f"Added PDF part from: {url}")
             elif "text/html" in content_type or url.lower().endswith(('.html', '.htm')):
-                # Parse HTML to extract readable text
                 soup = BeautifulSoup(response.content, "html.parser")
                 for element in soup(["script", "style", "nav", "footer", "header"]):
                     element.decompose()
                 text = soup.get_text()
                 lines = (line.strip() for line in text.splitlines())
                 content = "\n".join(chunk for line in lines for chunk in line.split("  ") if chunk)
-                parts.append(f"--- Content from {url} ---\n{content}\n")
+                parts.append(ContentPart(type="text", data=f"--- Content from {url} ---\n{content}\n"))
                 logging.info(f"Added parsed HTML part from: {url}")
             else:
-                # Treat as plain text (markdown, lean, txt, raw github files, etc.)
-                # This preserves crucial whitespace and formatting
                 content = response.text
-                parts.append(f"--- Content from {url} ---\n{content}\n")
+                parts.append(ContentPart(type="text", data=f"--- Content from {url} ---\n{content}\n"))
                 logging.info(f"Added plain text part from: {url}")
         except Exception as e:
             error_message = f"Error processing document '{url}': {e}"
@@ -440,20 +382,18 @@ def get_summary_context(paths_str: str) -> str:
     return "\n".join(summary_parts)
 
 
-def _make_json_config(schema, cached_content_name=None, thinking_budget=None):
-    """Creates a GenerateContentConfig for structured JSON output with optional thinking."""
-    kwargs = {
-        'response_mime_type': 'application/json',
-        'response_schema': schema,
-    }
-    if cached_content_name:
-        kwargs['cached_content'] = cached_content_name
-    if thinking_budget:
-        kwargs['thinking_config'] = types.ThinkingConfig(thinking_budget=thinking_budget)
-    return types.GenerateContentConfig(**kwargs)
+def _call_provider(provider: LLMProvider, model: str, contents: List[ContentPart],
+                   schema, thinking_budget=None, cache_name=None):
+    """Wrapper: calls provider, records token usage, returns parsed object."""
+    parsed, usage = provider.generate_structured(
+        model=model, contents=contents, schema=schema,
+        thinking_budget=thinking_budget, cache_name=cache_name,
+    )
+    token_tracker.record(usage)
+    return parsed
 
 
-def run_triage(client: genai.Client, diff_by_file: Dict[str, str], spec_checklist: str, additional_comments: str, model_name: str) -> List[ReviewCluster]:
+def run_triage(provider: LLMProvider, diff_by_file: Dict[str, str], spec_checklist: str, additional_comments: str, model_name: str) -> List[ReviewCluster]:
     """Triage Agent: Groups changed files into review clusters based on dependencies and coupling."""
     all_diffs = "\n".join([f"--- {f} ---\n{d}" for f, d in diff_by_file.items()])
 
@@ -481,12 +421,10 @@ def run_triage(client: genai.Client, diff_by_file: Dict[str, str], spec_checklis
         return [ReviewCluster(name=f, files=[f], review_question="Review this file independently.", priority="medium")
                 for f in diff_by_file if f.endswith('.lean')]
 
-    config = _make_json_config(TriageResult, thinking_budget=THINKING_BUDGET_LOW)
-
     try:
         logging.info("Triage Agent is grouping files into review clusters...")
-        response = generate_with_retry(client, model_name, [prompt_text], config)
-        triage: TriageResult = response.parsed
+        contents = [ContentPart(type="text", data=prompt_text)]
+        triage = _call_provider(provider, model_name, contents, TriageResult, thinking_budget=THINKING_BUDGET_LOW)
         logging.info(f"Triage complete: {len(triage.clusters)} clusters identified.")
         return triage.clusters
     except Exception as e:
@@ -495,7 +433,7 @@ def run_triage(client: genai.Client, diff_by_file: Dict[str, str], spec_checklis
                 for f in diff_by_file if f.endswith('.lean')]
 
 
-def analyze_specification(client: genai.Client, external_parts: List[Union[str, types.Part]], cached_content_name: str, model_name: str, all_diffs: str, summary_context: str = "", lake_graph: str = "") -> str:
+def analyze_specification(provider: LLMProvider, external_parts: List[ContentPart], cached_content_name: str, model_name: str, all_diffs: str, summary_context: str = "", lake_graph: str = "") -> str:
     """Agent A: Analyzes the external specification and generates a checklist."""
     if not external_parts and not cached_content_name:
         return ""
@@ -515,23 +453,16 @@ def analyze_specification(client: genai.Client, external_parts: List[Union[str, 
                                  .replace("{{REPO_STRUCTURE}}", summary_context or "No repository structure available.") \
                                  .replace("{{DEPENDENCY_GRAPH}}", lake_graph or "Dependency graph not available.")
     
-    config = _make_json_config(SpecChecklist, cached_content_name, thinking_budget=THINKING_BUDGET_HIGH)
-
-    if cached_content_name:
-        contents = [prompt_text]
-    else:
-        contents = [prompt_text] + external_parts
+    contents = [ContentPart(type="text", data=prompt_text)]
+    if not cached_content_name:
+        contents.extend(external_parts)
 
     try:
         logging.info("Agent A (Spec Analyst) is generating the formalization checklist...")
-        response = generate_with_retry(
-            client,
-            model_name,
-            contents,
-            config
+        checklist = _call_provider(
+            provider, model_name, contents, SpecChecklist,
+            thinking_budget=THINKING_BUDGET_HIGH, cache_name=cached_content_name,
         )
-
-        checklist: SpecChecklist = response.parsed
         checklist_str = ""
         if checklist:
             # Reference mapping table
@@ -668,7 +599,7 @@ def _format_file_review(review: FileReview, file_path: str) -> str:
     return "\n".join(parts)
 
 
-def analyze_file_changes_with_context(client: genai.Client, review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str, external_parts: list, cached_content_name: str, lean4_checklist: str, verdict_rules: str) -> Tuple[FileReview, str]:
+def analyze_file_changes_with_context(provider: LLMProvider, review_context: dict, file_path: str, file_diff: str, full_content: str, spec_checklist: str, external_parts: list, cached_content_name: str, lean4_checklist: str, verdict_rules: str) -> Tuple[FileReview, str]:
     """Agent B (Code Reviewer): Returns (structured FileReview, formatted markdown).
     On error, returns (None, error_message)."""
 
@@ -706,23 +637,21 @@ def analyze_file_changes_with_context(client: genai.Client, review_context: dict
                             .replace("{{LEAN4_CHECKLIST}}", lean4_checklist) \
                             .replace("{{VERDICT_RULES}}", verdict_rules)
 
-    config = _make_json_config(FileReview, cached_content_name, thinking_budget=THINKING_BUDGET_HIGH)
-    if cached_content_name:
-        contents = [prompt_text]
-    elif external_parts:
-        contents = [prompt_text] + external_parts
-    else:
-        contents = [prompt_text]
+    contents = [ContentPart(type="text", data=prompt_text)]
+    if not cached_content_name and external_parts:
+        contents.extend(external_parts)
 
     try:
         logging.info(f"Agent B is reviewing file: {file_path}...")
-        gemini_model = review_context.get("gemini_model")
-        response = generate_with_retry(client, gemini_model, contents, config)
-        review: FileReview = response.parsed
+        review_model = review_context.get("review_model")
+        review = _call_provider(
+            provider, review_model, contents, FileReview,
+            thinking_budget=THINKING_BUDGET_HIGH, cache_name=cached_content_name,
+        )
         formatted = _format_file_review(review, file_path)
         return review, formatted
     except Exception as e:
-        logging.error(f"Error during Gemini API call for {file_path}: {e}")
+        logging.error(f"Error during API call for {file_path}: {e}")
         return None, f"An error occurred while analyzing `{file_path}`: {e}"
 
 def _format_cross_file(analysis: CrossFileAnalysis) -> str:
@@ -750,7 +679,7 @@ def _format_cross_file(analysis: CrossFileAnalysis) -> str:
     return "\n\n".join(sections)
 
 
-def analyze_cross_file(client: genai.Client, diff_by_file: Dict[str, str], spec_checklist: str, pre_check_findings: str, repo_context: str, additional_comments: str, external_parts: list, cached_content_name: str, model_name: str) -> Tuple[CrossFileAnalysis, str]:
+def analyze_cross_file(provider: LLMProvider, diff_by_file: Dict[str, str], spec_checklist: str, pre_check_findings: str, repo_context: str, additional_comments: str, external_parts: list, cached_content_name: str, model_name: str) -> Tuple[CrossFileAnalysis, str]:
     """Cross-File Analysis Agent. Returns (structured CrossFileAnalysis, formatted markdown).
     On error returns (None, error_message)."""
     prompt_template_path = os.path.join(ACTION_PATH, "prompts", "cross_file_analysis.md")
@@ -784,18 +713,16 @@ def analyze_cross_file(client: genai.Client, diff_by_file: Dict[str, str], spec_
                                  .replace("{{DEPENDENCY_CONTEXT}}", repo_context) \
                                  .replace("{{ADDITIONAL_COMMENTS}}", additional_comments_section)
 
-    config = _make_json_config(CrossFileAnalysis, cached_content_name, thinking_budget=THINKING_BUDGET_HIGH)
-    if cached_content_name:
-        contents = [prompt_text]
-    elif external_parts:
-        contents = [prompt_text] + external_parts
-    else:
-        contents = [prompt_text]
+    contents = [ContentPart(type="text", data=prompt_text)]
+    if not cached_content_name and external_parts:
+        contents.extend(external_parts)
 
     try:
         logging.info("Cross-File Analysis Agent is analyzing composition and dependencies...")
-        response = generate_with_retry(client, model_name, contents, config)
-        analysis: CrossFileAnalysis = response.parsed
+        analysis = _call_provider(
+            provider, model_name, contents, CrossFileAnalysis,
+            thinking_budget=THINKING_BUDGET_HIGH, cache_name=cached_content_name,
+        )
         formatted = _format_cross_file(analysis)
         return analysis, formatted
     except Exception as e:
@@ -832,7 +759,7 @@ def _format_synthesis(summary: SynthesisSummary) -> str:
     return "\n".join(parts)
 
 
-def synthesize_overall_summary(client: genai.Client, per_file_reviews: Dict[str, str], per_file_structured: Dict[str, 'FileReview'], spec_checklist: str, pre_check_findings: str, cross_file_analysis: str, verdict_rules: str, model_name: str) -> Tuple[SynthesisSummary, str]:
+def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str, str], per_file_structured: Dict[str, 'FileReview'], spec_checklist: str, pre_check_findings: str, cross_file_analysis: str, verdict_rules: str, model_name: str) -> Tuple[SynthesisSummary, str]:
     """Generates a structured high-level summary. Returns (SynthesisSummary, formatted markdown).
     On error returns (None, error_message)."""
     if not per_file_reviews:
@@ -870,16 +797,14 @@ def synthesize_overall_summary(client: genai.Client, per_file_reviews: Dict[str,
                            .replace("{{CROSS_FILE_ANALYSIS}}", cross_file_analysis or "No cross-file analysis performed.") \
                            .replace("{{VERDICT_RULES}}", verdict_rules)
 
-    config = _make_json_config(SynthesisSummary, thinking_budget=THINKING_BUDGET_LOW)
-
     try:
         logging.info("Synthesizing overall summary...")
-        response = generate_with_retry(client, model_name, prompt, config)
-        summary: SynthesisSummary = response.parsed
+        contents = [ContentPart(type="text", data=prompt)]
+        summary = _call_provider(provider, model_name, contents, SynthesisSummary, thinking_budget=THINKING_BUDGET_LOW)
         formatted = _format_synthesis(summary)
         return summary, formatted
     except Exception as e:
-        logging.error(f"Error during Gemini API call for summary synthesis: {e}")
+        logging.error(f"Error during summary synthesis: {e}")
         return None, f"An error occurred while synthesizing the summary: {e}"
 
 def _get_diff_lines(diff_text: str) -> set:
@@ -978,19 +903,22 @@ def main():
     parser.add_argument("--external-refs", default="")
     parser.add_argument("--repo-context-refs", default="")
     parser.add_argument("--additional-comments", default="")
-    parser.add_argument("--gemini-model", default="gemini-2.5-pro", help="Default model for all agents")
-    parser.add_argument("--spec-model", default="", help="Model for Agent A (spec analysis). Falls back to --gemini-model")
-    parser.add_argument("--review-model", default="", help="Model for Agent B (per-file review). Falls back to --gemini-model")
-    parser.add_argument("--cross-file-model", default="", help="Model for cross-file analysis. Falls back to --gemini-model")
-    parser.add_argument("--synthesis-model", default="", help="Model for synthesis. Falls back to --gemini-model")
-    parser.add_argument("--thinking-budget", type=int, default=10240, help="Thinking token budget for deep-analysis agents (Agent A, B, Cross-File). Triage and Synthesis use 1/5 of this.")
+    parser.add_argument("--provider", default="gemini", help="LLM provider: gemini, anthropic, or openai")
+    parser.add_argument("--model", default="", help="Default model for all agents")
+    parser.add_argument("--spec-model", default="", help="Model for Agent A (spec analysis). Falls back to --model")
+    parser.add_argument("--review-model", default="", help="Model for Agent B (per-file review). Falls back to --model")
+    parser.add_argument("--cross-file-model", default="", help="Model for cross-file analysis. Falls back to --model")
+    parser.add_argument("--synthesis-model", default="", help="Model for synthesis. Falls back to --model")
+    parser.add_argument("--thinking-budget", type=int, default=10240, help="Thinking token budget for deep-analysis agents. Triage and Synthesis use 1/5 of this.")
     args = parser.parse_args()
 
     # Resolve per-agent models (fall back to default)
-    args.spec_model = args.spec_model or args.gemini_model
-    args.review_model = args.review_model or args.gemini_model
-    args.cross_file_model = args.cross_file_model or args.gemini_model
-    args.synthesis_model = args.synthesis_model or args.gemini_model
+    if not args.model:
+        args.model = os.environ.get("MODEL", "gemini-2.5-pro")
+    args.spec_model = args.spec_model or args.model
+    args.review_model = args.review_model or args.model
+    args.cross_file_model = args.cross_file_model or args.model
+    args.synthesis_model = args.synthesis_model or args.model
 
     # Configure thinking budgets
     global THINKING_BUDGET_HIGH, THINKING_BUDGET_LOW
@@ -1036,26 +964,23 @@ def main():
     if all_errors:
         logging.warning("Encountered non-critical errors. Review will proceed with partial context.")
 
-    api_key = os.getenv("GEMINI_API_KEY")
+    api_key = os.getenv("API_KEY") or os.getenv("GEMINI_API_KEY")  # backwards compat
     if not api_key:
-        logging.error("Error: GEMINI_API_KEY not set.")
+        logging.error("Error: API_KEY not set.")
         sys.exit(1)
-    client = genai.Client(api_key=api_key)
+
+    provider = create_provider(args.provider, api_key)
+    logging.info(f"Using LLM provider: {provider.name}")
 
     cached_content_name = None
     if external_parts:
         try:
             logging.info("Attempting to create context cache for external references...")
-            cache = client.caches.create(
-                model=args.gemini_model,
-                config=types.CreateCachedContentConfig(
-                    contents=external_parts,
-                    ttl="3600s",
-                    display_name="External Context Cache"
-                )
-            )
-            cached_content_name = cache.name
-            logging.info(f"Successfully created context cache: {cached_content_name}")
+            cached_content_name = provider.create_cache(args.model, external_parts)
+            if cached_content_name:
+                logging.info(f"Successfully created context cache: {cached_content_name}")
+            else:
+                logging.info("Provider does not support content caching. Using inline references.")
         except Exception as e:
             logging.warning(f"Could not create context cache (falling back to inline): {e}")
             context_warnings.append(
@@ -1067,7 +992,7 @@ def main():
             "external_context": "[Multimodal Content Provided]",
             "repo_context": repo_context,
             "additional_comments": args.additional_comments,
-            "gemini_model": args.review_model,
+            "review_model": args.review_model,
         }
         
         lean4_checklist_path = os.path.join(ACTION_PATH, "prompts", "lean4_checklist.md")
@@ -1095,7 +1020,7 @@ def main():
 
         # --- Multi-Agent Orchestration Step 1: Spec Analysis ---
         spec_checklist = analyze_specification(
-            client, external_parts, cached_content_name, args.spec_model, all_diffs,
+            provider, external_parts, cached_content_name, args.spec_model, all_diffs,
             summary_context=summary_context, lake_graph=os.environ.get('LAKE_GRAPH', '')
         )
         if spec_checklist:
@@ -1107,7 +1032,7 @@ def main():
         lean_files = {f: d for f, d in diff_by_file.items() if f.endswith('.lean')}
         is_small_pr = len(lean_files) <= 2
         if len(lean_files) > 2:
-            clusters = run_triage(client, lean_files, spec_checklist, args.additional_comments, args.gemini_model)
+            clusters = run_triage(provider, lean_files, spec_checklist, args.additional_comments, args.model)
         elif len(lean_files) == 2:
             # Two files: single cluster without the overhead of triage
             files = list(lean_files.keys())
@@ -1141,7 +1066,7 @@ def main():
                 augmented_ctx["cluster_context"] = cluster_context
 
             structured_review, formatted_text = analyze_file_changes_with_context(
-                client, augmented_ctx, file_path, file_diff, full_content,
+                provider, augmented_ctx, file_path, file_diff, full_content,
                 spec_checklist, external_parts, cached_content_name, lean4_checklist, verdict_rules
             )
             return file_path, structured_review, formatted_text
@@ -1197,7 +1122,7 @@ def main():
         cross_file_structured = None
         if len(lean_files) > 1:
             cross_file_structured, cross_file_text = analyze_cross_file(
-                client, diff_by_file, spec_checklist, pre_check_findings,
+                provider, diff_by_file, spec_checklist, pre_check_findings,
                 repo_context, args.additional_comments, external_parts,
                 cached_content_name, args.cross_file_model
             )
@@ -1237,7 +1162,7 @@ def main():
                     summary_text += f"\n**Pre-Check:** Escape hatches detected (see details below).\n"
         else:
             summary_structured, summary_text = synthesize_overall_summary(
-                client, per_file_reviews, per_file_structured, spec_checklist,
+                provider, per_file_reviews, per_file_structured, spec_checklist,
                 pre_check_findings, cross_file_text, verdict_rules, args.synthesis_model
             )
 
@@ -1304,8 +1229,7 @@ def main():
         logging.info(token_tracker.summary())
         if cached_content_name:
             try:
-                client.caches.delete(name=cached_content_name)
-                logging.info("Cleaned up context cache.")
+                provider.delete_cache(cached_content_name)
             except Exception as e:
                 logging.warning(f"Failed to delete context cache: {e}")
 

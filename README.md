@@ -88,7 +88,9 @@ jobs:
         uses: ./ # Or your-username/lean-review-workflow@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          provider: gemini  # or: anthropic, openai
+          model: gemini-2.5-pro  # or: claude-sonnet-4-20250514, gpt-4o
           pr_number: ${{ github.event.issue.number }}
           external_refs: ${{ steps.parse_command.outputs.external_refs }}
           additional_comments: ${{ steps.parse_command.outputs.additional_comments }}
@@ -124,9 +126,10 @@ jobs:
         uses: ./ 
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          api_key: ${{ secrets.LLM_API_KEY }}
+          provider: gemini  # or: anthropic, openai
+          model: gemini-2.5-pro
           pr_number: ${{ github.event.pull_request.number }}
-          gemini_model: "gemini-2.5-pro"
 ```
 
 ### Inputs
@@ -134,16 +137,27 @@ jobs:
 | Input | Required | Default | Description |
 |-------|----------|---------|-------------|
 | `github_token` | Yes | — | GitHub Token for API calls |
-| `gemini_api_key` | Yes | — | Gemini API Key for AI review generation |
+| `api_key` | Yes | — | API key for the LLM provider |
+| `provider` | No | `gemini` | LLM provider: `gemini`, `anthropic`, or `openai` |
+| `model` | Yes | — | Model name (e.g., `gemini-2.5-pro`, `claude-sonnet-4-20250514`, `gpt-4o`) |
 | `pr_number` | Yes | — | The Pull Request number |
 | `external_refs` | No | `""` | Comma-separated URLs to external documents (PDFs, HTML, raw source) |
 | `repo_context_refs` | No | `""` | Comma-separated paths to additional internal context files/directories |
 | `additional_comments` | No | `""` | Extra focus instructions for the AI reviewer |
-| `gemini_model` | No | `gemini-2.5-pro` | Default Gemini model for all agents |
 | `lint` | No | `false` | Whether to run the Lean linter |
 | `dependency_depth` | No | `2` | Depth of transitive dependency traversal (1=direct only, 2=imports of imports) |
+| `thinking_budget` | No | `10240` | Thinking token budget for deep-analysis agents (Gemini/Anthropic; ignored by OpenAI) |
 
 The review script also accepts per-agent model overrides via CLI flags: `--spec-model`, `--review-model`, `--cross-file-model`, `--synthesis-model`.
+
+### Provider Feature Notes
+
+| Feature | Gemini | Anthropic (Claude) | OpenAI (GPT) |
+|---------|--------|-------------------|--------------|
+| Structured output | Native schema | Tool use pattern | Native schema |
+| Native PDF | Yes | Yes (document blocks) | No (text extracted client-side via pymupdf) |
+| Extended thinking | ThinkingConfig | Thinking blocks | Not supported (ignored with warning) |
+| Content caching | Server-side (TTL) | Per-request (ephemeral) | Automatic |
 
 ## Project Structure
 
@@ -151,6 +165,7 @@ The review script also accepts per-agent model overrides via CLI flags: `--spec-
 lean-review-workflow/
   action.yml                  # GitHub Actions composite action definition
   review.py                   # Main review orchestration (multi-agent pipeline)
+  llm_provider.py             # LLM provider abstraction (Gemini, Anthropic, OpenAI)
   discover_files.py           # Dependency discovery via lake graph (BFS)
   lean_info_extractor.py      # Lean toolchain data extraction (axioms, sorry, diagnostics)
   lean_utils.py               # Shared utilities (module names, comment parsing, file cache)
@@ -166,6 +181,7 @@ lean-review-workflow/
     verdict_rules.md          # Hard verdict rules (injected into Agent B and Synthesis)
   tests/
     test_review.py
+    test_llm_provider.py
     test_discover_files.py
     test_lean_info_extractor.py
     test_lean_utils.py
@@ -205,6 +221,6 @@ python -m pytest tests/ -v
 
 ### Dependencies
 
-See `requirements.txt`: `requests`, `beautifulsoup4`, `google-genai`, `pydantic`.
+See `requirements.txt`: `requests`, `beautifulsoup4`, `pydantic`, `google-genai`, `anthropic`, `openai`, `pymupdf`.
 
 Contributions are welcome. Please ensure changes pass the existing test suite.
