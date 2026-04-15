@@ -1,0 +1,448 @@
+"""Unit tests for review.py core functions."""
+
+import pytest
+import sys
+import os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from review import (
+    split_diff_into_files,
+    _extract_added_lines,
+    _is_in_string,
+    run_mechanical_prechecks,
+    _get_diff_lines,
+    _load_prompt,
+    _validate_url,
+    _is_retryable,
+    _is_rate_limit,
+)
+from lean_utils import is_in_comment
+
+
+# --- split_diff_into_files ---
+
+class TestSplitDiffIntoFiles:
+    def test_basic_split(self):
+        diff = """diff --git a/Foo.lean b/Foo.lean
+--- a/Foo.lean
++++ b/Foo.lean
+@@ -1,3 +1,4 @@
+ import Bar
++import Baz
+ def foo := 1
+diff --git a/Bar.lean b/Bar.lean
+--- a/Bar.lean
++++ b/Bar.lean
+@@ -1,2 +1,2 @@
+-def bar := 1
++def bar := 2
+"""
+        result = split_diff_into_files(diff)
+        assert "Foo.lean" in result
+        assert "Bar.lean" in result
+        assert len(result) == 2
+
+    def test_empty_diff(self):
+        assert split_diff_into_files("") == {}
+
+    def test_rename(self):
+        diff = """diff --git a/Old.lean b/New.lean
+similarity index 90%
+rename from Old.lean
+rename to New.lean
+--- a/Old.lean
++++ b/New.lean
+@@ -1 +1 @@
+-old content
++new content
+"""
+        result = split_diff_into_files(diff)
+        assert "New.lean" in result
+        assert "Old.lean" not in result
+
+    def test_non_lean_files_included(self):
+        diff = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-old
++new
+"""
+        result = split_diff_into_files(diff)
+        assert "README.md" in result
+
+
+# --- _extract_added_lines ---
+
+class TestExtractAddedLines:
+    def test_basic(self):
+        diff = """+++ b/Foo.lean
+@@ -1,3 +1,4 @@
+ import Bar
++import Baz
++import Qux
+ def foo := 1
+"""
+        added = _extract_added_lines(diff)
+        assert "import Baz" in added
+        assert "import Qux" in added
+        assert "import Bar" not in added
+
+    def test_ignores_diff_header(self):
+        diff = """+++ b/Foo.lean
+@@ -1 +1 @@
++new line
+"""
+        added = _extract_added_lines(diff)
+        assert added == ["new line"]
+        # +++ line should not appear
+        assert "++ b/Foo.lean" not in added
+
+
+# --- is_in_comment (now from lean_utils) ---
+
+class TestIsInComment:
+    """Tests for lean_utils.is_in_comment with nested block comment support."""
+
+    def test_single_line_comment(self):
+        is_comment, depth = is_in_comment("  -- this is a comment", 0)
+        assert is_comment is True
+        assert depth == 0
+
+    def test_not_comment(self):
+        is_comment, depth = is_in_comment("def foo := 1", 0)
+        assert is_comment is False
+        assert depth == 0
+
+    def test_block_comment_start(self):
+        is_comment, depth = is_in_comment("/- start of block", 0)
+        assert is_comment is True
+        assert depth == 1
+
+    def test_inside_block_comment(self):
+        is_comment, depth = is_in_comment("  still in block", 1)
+        assert is_comment is True
+        assert depth == 1
+
+    def test_block_comment_end(self):
+        is_comment, depth = is_in_comment("  end of block -/", 1)
+        assert is_comment is True
+        assert depth == 0
+
+    def test_single_line_block_comment(self):
+        is_comment, depth = is_in_comment("/- single line -/", 0)
+        assert is_comment is True
+        assert depth == 0
+
+    def test_nested_comment_preserves_outer(self):
+        """Closing inner /- -/ should NOT close the outer block."""
+        # depth=2 means we're inside /- /- ... here
+        is_comment, depth = is_in_comment("  inner close -/", 2)
+        assert is_comment is True
+        assert depth == 1  # still inside the outer comment
+
+
+# --- _is_in_string ---
+
+class TestIsInString:
+    def test_keyword_in_string(self):
+        assert _is_in_string("sorry", 'let msg := "sorry about that"') is True
+
+    def test_keyword_outside_string(self):
+        assert _is_in_string("sorry", "  sorry") is False
+
+    def test_keyword_both(self):
+        # "sorry" appears both in a string and outside — should return False
+        assert _is_in_string("sorry", 'let x := "sorry"; sorry') is False
+
+    def test_no_strings(self):
+        assert _is_in_string("axiom", "axiom myAxiom : True") is False
+
+
+# --- run_mechanical_prechecks ---
+
+class TestMechanicalPrechecks:
+    def test_no_findings(self, tmp_path):
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text("def foo := 1\n")
+        diff = "+def foo := 1\n"
+        result = run_mechanical_prechecks({str(lean_file): diff})
+        assert "No escape hatches" in result
+
+    def test_sorry_in_diff(self, tmp_path):
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text("theorem foo : True := sorry\n")
+        diff = "+theorem foo : True := sorry\n"
+        result = run_mechanical_prechecks({str(lean_file): diff})
+        assert "sorry" in result
+        assert "introduced" in result.lower()
+
+    def test_sorry_in_comment_ignored(self, tmp_path):
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text("-- sorry this is a comment\ndef foo := 1\n")
+        diff = "+-- sorry this is a comment\n+def foo := 1\n"
+        result = run_mechanical_prechecks({str(lean_file): diff})
+        # sorry in comment should not be flagged as introduced
+        assert "**`sorry`** introduced" not in result
+
+    def test_non_lean_file_skipped(self, tmp_path):
+        md_file = tmp_path / "README.md"
+        md_file.write_text("sorry\n")
+        result = run_mechanical_prechecks({str(md_file): "+sorry\n"})
+        assert "No escape hatches" in result
+
+    def test_large_file_warning(self, tmp_path):
+        lean_file = tmp_path / "Big.lean"
+        lean_file.write_text("def x := 1\n" * 2000)
+        diff = "+def x := 1\n"
+        result = run_mechanical_prechecks({str(lean_file): diff})
+        assert "Large file" in result
+
+
+# --- _get_diff_lines ---
+
+class TestGetDiffLines:
+    def test_basic_lines(self):
+        diff = """@@ -1,3 +1,4 @@
+ context line 1
++added line
+ context line 2
+ context line 3
+"""
+        lines = _get_diff_lines(diff)
+        assert 1 in lines   # context
+        assert 2 in lines   # added
+        assert 3 in lines   # context
+        assert 4 in lines   # context
+
+    def test_empty_diff(self):
+        assert _get_diff_lines("") == set()
+
+    def test_deleted_lines_not_included(self):
+        diff = """@@ -1,3 +1,2 @@
+ context
+-deleted line
+ remaining
+"""
+        lines = _get_diff_lines(diff)
+        assert 1 in lines
+        assert 2 in lines
+        # Only 2 lines in new file, no line 3
+
+
+# --- _load_prompt ---
+
+class TestLoadPrompt:
+    def test_basic_replacement(self, tmp_path):
+        """Test that _load_prompt correctly substitutes placeholders."""
+        prompts_dir = tmp_path / "prompts"
+        prompts_dir.mkdir()
+        prompt_file = prompts_dir / "test_prompt.md"
+        prompt_file.write_text("Hello {{NAME}}, your role is {{ROLE}}.")
+
+        import review
+        original_path = review.ACTION_PATH
+        try:
+            review.ACTION_PATH = str(tmp_path)
+            result = _load_prompt("test_prompt.md", {"NAME": "Alice", "ROLE": "reviewer"})
+            assert result == "Hello Alice, your role is reviewer."
+        finally:
+            review.ACTION_PATH = original_path
+
+
+# --- URL Validation ---
+
+class TestValidateUrl:
+    def test_valid_https(self):
+        is_safe, _ = _validate_url("https://arxiv.org/pdf/2301.12345.pdf")
+        assert is_safe is True
+
+    def test_valid_http(self):
+        is_safe, _ = _validate_url("http://example.com/file.pdf")
+        assert is_safe is True
+
+    def test_blocked_localhost(self):
+        is_safe, reason = _validate_url("http://localhost:8080/secret")
+        assert is_safe is False
+        assert "localhost" in reason.lower()
+
+    def test_blocked_private_ip(self):
+        is_safe, reason = _validate_url("http://192.168.1.1/admin")
+        assert is_safe is False
+        assert "private" in reason.lower() or "reserved" in reason.lower()
+
+    def test_blocked_loopback(self):
+        is_safe, reason = _validate_url("http://127.0.0.1/metadata")
+        assert is_safe is False
+
+    def test_blocked_non_http_scheme(self):
+        is_safe, reason = _validate_url("file:///etc/passwd")
+        assert is_safe is False
+        assert "scheme" in reason.lower()
+
+    def test_blocked_metadata_endpoint(self):
+        is_safe, reason = _validate_url("http://metadata.google.internal/v1/instance")
+        assert is_safe is False
+
+    def test_no_hostname(self):
+        is_safe, reason = _validate_url("http://")
+        assert is_safe is False
+
+
+# --- Retry Logic ---
+
+class TestRetryLogic:
+    def test_rate_limit_is_retryable(self):
+        error = Exception("429 Resource has been exhausted")
+        assert _is_retryable(error) is True
+        assert _is_rate_limit(error) is True
+
+    def test_server_error_is_retryable(self):
+        error = Exception("500 Internal Server Error")
+        assert _is_retryable(error) is True
+        assert _is_rate_limit(error) is False
+
+    def test_auth_error_not_retryable(self):
+        error = Exception("403 Permission denied")
+        assert _is_retryable(error) is False
+
+    def test_invalid_request_not_retryable(self):
+        error = Exception("400 Invalid request")
+        assert _is_retryable(error) is False
+
+
+# --- Pydantic Schema Tests ---
+
+class TestPydanticSchemas:
+    def test_file_review_schema(self):
+        from review import FileReview, Finding
+        review = FileReview(
+            analysis="The code defines a ring homomorphism. Key risk: missing commutativity hypothesis.",
+            verdict="Approved",
+            checklist_results=[],
+            critical_misformalizations=[],
+            lean_issues=[Finding(description="test", location="Foo.lean:1")],
+            nitpicks=[]
+        )
+        assert review.verdict == "Approved"
+        assert "ring homomorphism" in review.analysis
+        assert len(review.lean_issues) == 1
+
+    def test_file_review_analysis_optional(self):
+        from review import FileReview
+        review = FileReview(verdict="Approved")
+        assert review.analysis == ""
+
+    def test_spec_checklist_schema(self):
+        from review import SpecChecklist, ChecklistItem, ReferenceMappingEntry
+        checklist = SpecChecklist(
+            reference_mapping=[
+                ReferenceMappingEntry(
+                    paper_result="Theorem 3.1",
+                    mathematical_content="For all n >= 1, the bound holds with error <= 1/n",
+                    status="Present"
+                )
+            ],
+            items=[
+                ChecklistItem(
+                    concept="Completeness",
+                    verification_steps=["Check hypotheses"],
+                    severity="Critical"
+                )
+            ]
+        )
+        assert len(checklist.reference_mapping) == 1
+        assert checklist.items[0].severity == "Critical"
+
+    def test_cross_file_analysis_schema(self):
+        from review import CrossFileAnalysis, Finding
+        analysis = CrossFileAnalysis(
+            composition_issues=[Finding(description="type mismatch", location="A.lean -> B.lean")],
+            escape_hatch_impact=[],
+            external_dependency_issues=[],
+            missing_cross_file_verification=[]
+        )
+        assert len(analysis.composition_issues) == 1
+
+    def test_triage_result_schema(self):
+        from review import TriageResult, ReviewCluster
+        triage = TriageResult(clusters=[
+            ReviewCluster(
+                name="Sumcheck chain",
+                files=["A.lean", "B.lean"],
+                review_question="Do types match?",
+                priority="critical",
+                review_strategy="Check that error bounds compose across the sumcheck chain.",
+                key_hypotheses=["Output type of Steps.lean matches input of CoreInteraction.lean"]
+            )
+        ])
+        assert triage.clusters[0].priority == "critical"
+        assert "error bounds" in triage.clusters[0].review_strategy
+        assert len(triage.clusters[0].key_hypotheses) == 1
+
+    def test_triage_strategy_optional(self):
+        from review import ReviewCluster
+        cluster = ReviewCluster(name="test", files=["A.lean"], review_question="", priority="low")
+        assert cluster.review_strategy == ""
+        assert cluster.key_hypotheses == []
+
+    def test_cross_file_analysis_has_analysis(self):
+        from review import CrossFileAnalysis
+        analysis = CrossFileAnalysis(
+            analysis="Traced chain: A.lean -> B.lean -> C.lean. Type flow is consistent.",
+        )
+        assert "Traced chain" in analysis.analysis
+
+
+# --- Structured Synthesis Input ---
+
+class TestStructuredSynthesisInput:
+    def test_structured_data_serialization(self):
+        """Verify structured review data is correctly serialized for synthesis."""
+        import json
+        from review import FileReview, Finding, ChecklistResult
+
+        reviews = {
+            "Foo.lean": FileReview(
+                verdict="Changes Requested",
+                checklist_results=[
+                    ChecklistResult(item="Completeness", status="violated", explanation="Missing hypothesis"),
+                    ChecklistResult(item="Soundness", status="satisfied", explanation="OK"),
+                ],
+                critical_misformalizations=[Finding(description="Wrong bound")],
+                lean_issues=[Finding(description="Issue 1"), Finding(description="Issue 2")],
+                nitpicks=[]
+            ),
+            "Bar.lean": FileReview(
+                verdict="Approved",
+                checklist_results=[],
+                critical_misformalizations=[],
+                lean_issues=[],
+                nitpicks=[Finding(description="Naming")]
+            ),
+        }
+
+        # Build structured data the same way synthesize_overall_summary does
+        structured = {}
+        for fp, review in reviews.items():
+            structured[fp] = {
+                "verdict": review.verdict,
+                "critical_count": len(review.critical_misformalizations),
+                "issue_count": len(review.lean_issues),
+                "nitpick_count": len(review.nitpicks),
+                "violated_checklist": [cr.item for cr in review.checklist_results if cr.status == "violated"],
+                "unclear_checklist": [cr.item for cr in review.checklist_results if cr.status == "unclear"],
+            }
+
+        assert structured["Foo.lean"]["verdict"] == "Changes Requested"
+        assert structured["Foo.lean"]["critical_count"] == 1
+        assert structured["Foo.lean"]["issue_count"] == 2
+        assert structured["Foo.lean"]["violated_checklist"] == ["Completeness"]
+        assert structured["Bar.lean"]["verdict"] == "Approved"
+        assert structured["Bar.lean"]["nitpick_count"] == 1
+
+        # Verify it serializes to valid JSON
+        json_str = json.dumps(structured, indent=2)
+        parsed = json.loads(json_str)
+        assert parsed["Foo.lean"]["critical_count"] == 1

@@ -6,5 +6,12 @@
 5. **Simp Lemmas:** If `@[simp]` is used, is the lemma actually a good simp lemma? (Does the LHS simplify to a strictly simpler RHS? Is the LHS in normal form?)
 6. **Computability:** Does the definition unnecessarily use `noncomputable` where a computable alternative exists in Mathlib? Conversely, does it unnecessarily twist itself to be computable when classical tools (`Classical.choice`, `Classical.em`) are idiomatic for the domain?
 7. **Naming Conventions:** Do the definitions and lemmas follow standard Lean 4 / Mathlib conventions? (`camelCase` for variables/defs, `UpperCamelCase` for types/classes, `snake_case` for theorems/proofs).
-8. **Unfinished Proofs:** Flag any use of `sorry` or `admit`. These indicate incomplete proofs.
-9. **Kernel Bypass:** Flag any use of `native_decide`. Verify that the proposition being decided is genuinely decidable and that relying on kernel-bypass is intentional and documented.
+8. **Escape Hatches & Kernel Bypasses (Critical):** The following constructs bypass or weaken Lean's kernel verification. All must be flagged:
+    - `sorry` or `admit` — incomplete proofs; the most common escape hatch
+    - `axiom` declarations (outside Mathlib core or well-established libraries) — introduces unverified assumptions; functionally equivalent to `sorry` for downstream proofs
+    - `native_decide` — kernel bypass; verify the proposition is genuinely decidable and that bypassing is intentional and documented
+    - `implemented_by` — replaces the verified implementation with unverified native code
+    - `opaque` — hides the definition body from the kernel, blocking downstream reduction and verification
+    - `sorryAx` — axiom-level sorry, often auto-generated
+    - `Decidable.decide` on non-trivially-decidable propositions — may silently produce `Decidable.isFalse` for true statements
+9. **Project Context Adaptation:** Adapt checklist items to the project's domain. For example, in a project using `Field` and `Fintype` (e.g., cryptographic formalization), focus typeclass checks on those rather than Mathlib-specific patterns like `CommRing` vs. `Semiring`. Consider what algebraic structures and proof patterns are idiomatic for the specific project.

@@ -22,11 +22,19 @@ inputs:
   gemini_model:
     description: 'The Gemini model to use for AI review generation'
     required: false
-    default: 'gemini-3.1-pro-preview'
+    default: 'gemini-2.5-pro'
   lint:
     description: 'Whether to run the linter'
     required: false
     default: 'false'
+  dependency_depth:
+    description: 'Depth of transitive dependency traversal (1=direct only, 2=imports of imports)'
+    required: false
+    default: '2'
+  thinking_budget:
+    description: 'Thinking token budget for deep-analysis agents (spec, per-file review, cross-file). Triage and synthesis use 1/5 of this.'
+    required: false
+    default: '10240'
 outputs:
   review_text:
     description: "The generated review text"
@@ -68,8 +76,20 @@ runs:
       env:
         GH_TOKEN: ${{ inputs.github_token }}
         PR_NUMBER: ${{ inputs.pr_number }}
+        DEPENDENCY_DEPTH: ${{ inputs.dependency_depth }}
       run: python ${{ github.action_path }}/discover_files.py
 
+
+    - name: Extract Lean Toolchain Info
+      id: lean_info
+      shell: bash
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}
+        PR_NUMBER: ${{ inputs.pr_number }}
+        CHANGED_FILES: ${{ steps.discover_files.outputs.discovered_files }}
+        SUMMARY_FILES: ${{ steps.discover_files.outputs.summary_files }}
+      run: python ${{ github.action_path }}/lean_info_extractor.py
 
     - name: Run AI Review Script
       shell: bash
@@ -81,8 +101,12 @@ runs:
         EXTERNAL_REFS: ${{ inputs.external_refs }}
         REPO_CONTEXT_REFS_INPUT: ${{ inputs.repo_context_refs }}
         DISCOVERED_FILES: ${{ steps.discover_files.outputs.discovered_files }}
+        SUMMARY_FILES: ${{ steps.discover_files.outputs.summary_files }}
+        LAKE_GRAPH: ${{ steps.discover_files.outputs.lake_graph }}
+        LEAN_INFO: ${{ steps.lean_info.outputs.lean_info_formatted }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
         GEMINI_MODEL: ${{ inputs.gemini_model }}
+        THINKING_BUDGET: ${{ inputs.thinking_budget }}
       run: |
         # Construct REPO_CONTEXT_REFS safely to avoid leading comma
         if [ -n "$REPO_CONTEXT_REFS_INPUT" ] && [ -n "$DISCOVERED_FILES" ]; then
@@ -102,19 +126,22 @@ runs:
           --external-refs "$EXTERNAL_REFS" \
           --repo-context-refs "$REPO_CONTEXT_REFS" \
           --additional-comments "$ADDITIONAL_COMMENTS" \
-          --gemini-model "$GEMINI_MODEL" >> $GITHUB_OUTPUT
+          --gemini-model "$GEMINI_MODEL" \
+          --thinking-budget "$THINKING_BUDGET" >> $GITHUB_OUTPUT
         echo "$EOF_MARKER" >> $GITHUB_OUTPUT
 
-    - name: Post Review Comment
+    - name: Post Review
       uses: actions/github-script@v8
       env:
         REVIEW_TEXT: ${{ steps.run_review.outputs.review_text }}
         EXTERNAL_REFS: ${{ inputs.external_refs }}
         REPO_CONTEXT_REFS: ${{ inputs.repo_context_refs }}
         ADDITIONAL_COMMENTS: ${{ inputs.additional_comments }}
+        PR_NUMBER: ${{ inputs.pr_number }}
       with:
         retries: 3
         script: |
+          const fs = require('fs');
           let headerText = '### 🤖 Initial AI review without external context';
           if (process.env.EXTERNAL_REFS || process.env.REPO_CONTEXT_REFS || process.env.ADDITIONAL_COMMENTS) {
             headerText = '### 🤖 AI Review (with external context)';
@@ -122,31 +149,67 @@ runs:
           const header = headerText + '\n\n';
           const body = header + process.env.REVIEW_TEXT;
           const { owner, repo } = context.repo;
-          const issue_number = context.issue.number;
+          const pr_number = parseInt(process.env.PR_NUMBER);
 
-          const comments = await github.rest.issues.listComments({
-            owner,
-            repo,
-            issue_number,
+          // Try to post a proper GitHub Review with line annotations
+          let annotations = [];
+          try {
+            if (fs.existsSync('review_annotations.json')) {
+              annotations = JSON.parse(fs.readFileSync('review_annotations.json', 'utf8'));
+            }
+          } catch (e) {
+            console.log('No annotations file found, posting as comment only.');
+          }
+
+          if (annotations.length > 0) {
+            try {
+              // Get the PR's head SHA for the review
+              const pr = await github.rest.pulls.get({ owner, repo, pull_number: pr_number });
+              const commit_id = pr.data.head.sha;
+
+              // GitHub limits to 50 comments per review
+              const comments = annotations.slice(0, 50).map(a => ({
+                path: a.path,
+                line: a.line,
+                side: a.side,
+                body: a.body
+              }));
+
+              await github.rest.pulls.createReview({
+                owner,
+                repo,
+                pull_number: pr_number,
+                commit_id,
+                body: body,
+                event: 'COMMENT',
+                comments
+              });
+              console.log(`Posted review with ${comments.length} line annotations.`);
+              return;
+            } catch (e) {
+              console.log(`Failed to post review with annotations: ${e.message}. Falling back to comment.`);
+            }
+          }
+
+          // Fallback: post/update a regular PR comment
+          const issue_number = pr_number;
+          const existingComments = await github.rest.issues.listComments({
+            owner, repo, issue_number,
           });
 
-          const botComment = comments.data.find(comment => 
+          const botComment = existingComments.data.find(comment =>
             comment.user.type === 'Bot' && (comment.body.includes('### 🤖 AI Review') || comment.body.includes('### 🤖 Initial AI review'))
           );
 
           if (botComment) {
             await github.rest.issues.updateComment({
-              owner,
-              repo,
+              owner, repo,
               comment_id: botComment.id,
               body
             });
           } else {
             await github.rest.issues.createComment({
-              owner,
-              repo,
-              issue_number,
-              body
+              owner, repo, issue_number, body
             });
           }
 
@@ -154,4 +217,4 @@ runs:
       if: always()
       shell: bash
       run: |
-        rm -f ./action-requirements.txt
+        rm -f ./action-requirements.txt ./review_annotations.json
