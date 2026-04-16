@@ -24,7 +24,7 @@ inputs:
     description: 'Additional comments for the review'
     required: false
   model:
-    description: 'The LLM model to use (e.g., gemini-3.1-pro-preview, claude-opus-4-6, gpt-5.4)'
+    description: 'The LLM model to use (e.g., gemini-3.1-pro-preview, claude-opus-4-7, gpt-5.4)'
     required: true
   lint:
     description: 'Whether to run the linter'
