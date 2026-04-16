@@ -38,15 +38,18 @@ This GitHub Action provides an AI-powered code review for Pull Requests in Lean 
 
 ## Usage
 
-This is a composite action. To unlock its full power (the `external_refs` and `additional_comments` inputs), it is recommended to trigger via a **PR Comment (ChatOps)**.
+This is a composite action. It supports both automatic review on PR open and on-demand review via `/review` comments, ideally combined in a single workflow.
 
-### Recommended: ChatOps Workflow (Dynamic PR Comments)
+### Recommended: Combined Workflow (Auto + ChatOps)
 
-Create a workflow file at `.github/workflows/reviews.yml`:
+Create a workflow file at `.github/workflows/ai-review.yml`:
 
 ```yaml
-name: `PR Review`
+name: PR Review
+
 on:
+  pull_request:
+    types: [opened]
   issue_comment:
     types: [created]
 
@@ -55,62 +58,113 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ai_review_chatops:
-    if: ${{ github.event.issue.pull_request && startsWith(github.event.comment.body, '/review') }}
+  review:
+    if: >-
+      (
+        github.event_name == 'pull_request' &&
+        (
+          github.event.pull_request.author_association == 'OWNER' ||
+          github.event.pull_request.author_association == 'MEMBER' ||
+          github.event.pull_request.author_association == 'COLLABORATOR'
+        )
+      ) ||
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/review') &&
+        (
+          github.event.comment.author_association == 'OWNER' ||
+          github.event.comment.author_association == 'MEMBER' ||
+          github.event.comment.author_association == 'COLLABORATOR'
+        )
+      )
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
       pull-requests: write
     steps:
-      - name: Parse Command
-        id: parse_command
-        uses: actions/github-script@v9.0.0
-        with:
-          script: |
-            const body = context.payload.comment.body;
-            let external_refs = "";
-            let additional_comments = "";
-            
-            const lines = body.split('\n');
-            for (const line of lines) {
-              if (line.startsWith('refs: ')) external_refs = line.replace('refs: ', '').trim();
-              if (line.startsWith('focus: ')) additional_comments = line.replace('focus: ', '').trim();
-            }
-            core.setOutput("external_refs", external_refs);
-            core.setOutput("additional_comments", additional_comments);
-
-      - name: Checkout repository
-        uses: actions/checkout@v6.0.2
-        with:
-          fetch-depth: 0
-
-      - name: Checkout PR
+      - name: Extract arguments from comment
+        id: get_args
+        if: github.event_name == 'issue_comment'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh pr checkout ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # Generate a random EOF marker for the GITHUB_OUTPUT heredoc.
+          # This variable is passed to awk which handles all output writing.
+          EOF=$(openssl rand -hex 8)
 
-      - name: Run AI Code Review Action
-        uses: alexanderlhicks/lean-review-workflow@main
+          awk -v eof="$EOF" -v gh_out="$GITHUB_OUTPUT" '
+            BEGIN {
+              ext = ""
+              repo = ""
+              com = ""
+              section = ""
+            }
+            /^External:/ { section="ext"; next }
+            /^Internal:/ { section="repo"; next }
+            /^Comments:/ { section="com"; next }
+            {
+              gsub(/\r/, "", $0);
+              gsub(/^[ \t]+|[ \t]+$/, "", $0);
+              if ($0 == "" || $0 == "/review") { next }
+
+              if (section == "ext") {
+                sub(/^- +/, "");
+                if (ext != "") { ext = ext "," $0 } else { ext = $0 }
+              }
+              else if (section == "repo") {
+                sub(/^- +/, "");
+                if (repo != "") { repo = repo "," $0 } else { repo = $0 }
+              }
+              else if (section == "com") {
+                if (com != "") { com = com "\n" $0 } else { com = $0 }
+              }
+            }
+            END {
+              printf "external_refs=%s\n", ext >> gh_out
+              printf "repo_context_refs=%s\n", repo >> gh_out
+              printf "additional_comments<<%s\n", eof >> gh_out
+              printf "%s\n", com >> gh_out
+              printf "%s\n", eof >> gh_out
+            }
+          ' <<< "$COMMENT_BODY"
+        shell: bash
+
+      - uses: alexanderlhicks/lean-review-workflow@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.LLM_API_KEY }}
-          provider: anthropic  # or: anthropic, openai
-          model: claude-opus-4-7  # or: gemini-3.1-pro-preview, gpt-5.4
-          pr_number: ${{ github.event.issue.number }}
-          external_refs: ${{ steps.parse_command.outputs.external_refs }}
-          additional_comments: ${{ steps.parse_command.outputs.additional_comments }}
+          provider: gemini  # or: anthropic, openai
+          model: gemini-2.5-pro-preview-06-05
+          pr_number: ${{ github.event.issue.number || github.event.pull_request.number }}
+          external_refs: "${{ steps.get_args.outputs.external_refs }}"
+          repo_context_refs: "${{ steps.get_args.outputs.repo_context_refs }}"
+          additional_comments: "${{ steps.get_args.outputs.additional_comments }}"
 ```
+
+**Key features of this workflow:**
+- **Concurrency control** prevents duplicate reviews on the same PR.
+- **Access control** restricts triggers to owners, members, and collaborators only (prevents abuse on public repos).
+- **Combined triggers** handle both auto-review on PR open and on-demand `/review` comments.
+- **Multiline comment parsing** supports structured sections with bullet points.
 
 **How developers use it:**
-Leave a comment on any PR:
+
+Automatic review runs on PR open. For re-review with context, leave a comment:
 ```text
 /review
-refs: https://arxiv.org/pdf/2301.12345.pdf
-focus: Check if my definition of a Perfectoid Space matches Section 4.
+External:
+- https://arxiv.org/pdf/2301.12345.pdf
+- https://eprint.iacr.org/2024/001.pdf
+Internal:
+- docs/spec.md
+Comments:
+Check that the definition of the ring homomorphism in Section 4
+matches the formalization, especially the commutativity hypothesis.
 ```
 
-### Alternative: Standard Push Workflow (Static)
+### Alternative: Minimal Push Workflow (No ChatOps)
 
 ```yaml
 name: AI Code Review for Lean PRs
@@ -119,22 +173,29 @@ on:
   pull_request:
     types: [opened, synchronize]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   ai_review_lean:
+    if: >-
+      github.event.pull_request.author_association == 'OWNER' ||
+      github.event.pull_request.author_association == 'MEMBER' ||
+      github.event.pull_request.author_association == 'COLLABORATOR'
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     permissions:
       contents: read
       pull-requests: write
 
     steps:
-      - name: Run AI Code Review Action
-        uses: ./ 
+      - uses: alexanderlhicks/lean-review-workflow@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.LLM_API_KEY }}
-          provider: gemini  # or: anthropic, openai
-          model: gemini-3.1-pro-preview
+          provider: anthropic  # or: gemini, openai
+          model: claude-opus-4-7 # or gemini-3.1-pro-preview, gpt-5.4
           pr_number: ${{ github.event.pull_request.number }}
 ```
 
@@ -153,8 +214,11 @@ jobs:
 | `lint` | No | `false` | Whether to run the Lean linter |
 | `dependency_depth` | No | `2` | Depth of transitive dependency traversal (1=direct only, 2=imports of imports) |
 | `thinking_budget` | No | `10240` | Thinking token budget for deep-analysis agents (Gemini/Anthropic; ignored by OpenAI) |
-
-The review script also accepts per-agent model overrides via CLI flags: `--spec-model`, `--review-model`, `--cross-file-model`, `--synthesis-model`.
+| `spec_model` | No | `model` | Model override for the Specification Analyst agent |
+| `triage_model` | No | `model` | Model override for the Triage agent |
+| `review_model` | No | `model` | Model override for the per-file Code Reviewer agent |
+| `cross_file_model` | No | `model` | Model override for the Cross-File Analysis agent |
+| `synthesis_model` | No | `model` | Model override for the Synthesis agent |
 
 ### Provider Feature Notes
 
