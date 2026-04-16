@@ -42,13 +42,17 @@ This is a composite action. To unlock its full power (the `external_refs` and `a
 
 ### Recommended: ChatOps Workflow (Dynamic PR Comments)
 
-Create a workflow file at `.github/workflows/ai-chatops.yml`:
+Create a workflow file at `.github/workflows/reviews.yml`:
 
 ```yaml
-name: AI PR ChatOps
+name: `PR Review`
 on:
   issue_comment:
     types: [created]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
 
 jobs:
   ai_review_chatops:
@@ -61,7 +65,7 @@ jobs:
     steps:
       - name: Parse Command
         id: parse_command
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9.0.0
         with:
           script: |
             const body = context.payload.comment.body;
@@ -77,7 +81,7 @@ jobs:
             core.setOutput("additional_comments", additional_comments);
 
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.2
         with:
           fetch-depth: 0
 
@@ -87,7 +91,7 @@ jobs:
         run: gh pr checkout ${{ github.event.issue.number }}
 
       - name: Run AI Code Review Action
-        uses: ./ # Or your-username/lean-review-workflow@main
+        uses: alexanderlhicks/lean-review-workflow@main
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.LLM_API_KEY }}
