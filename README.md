@@ -95,8 +95,8 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           api_key: ${{ secrets.LLM_API_KEY }}
-          provider: gemini  # or: anthropic, openai
-          model: gemini-3.1-pro-preview  # or: claude-opus-4-6, gpt-5.4
+          provider: anthropic  # or: anthropic, openai
+          model: claude-opus-4-7  # or: gemini-3.1-pro-preview, gpt-5.4
           pr_number: ${{ github.event.issue.number }}
           external_refs: ${{ steps.parse_command.outputs.external_refs }}
           additional_comments: ${{ steps.parse_command.outputs.additional_comments }}
@@ -145,7 +145,7 @@ jobs:
 | `github_token` | Yes | — | GitHub Token for API calls |
 | `api_key` | Yes | — | API key for the LLM provider |
 | `provider` | No | `gemini` | LLM provider: `gemini`, `anthropic`, or `openai` |
-| `model` | Yes | — | Model name (e.g., `gemini-3.1-pro-preview`, `claude-opus-4-6`, `gpt-5.4`) |
+| `model` | Yes | — | Model name (e.g., `gemini-3.1-pro-preview`, `claude-opus-4-7`, `gpt-5.4`) |
 | `pr_number` | Yes | — | The Pull Request number |
 | `external_refs` | No | `""` | Comma-separated URLs to external documents (PDFs, HTML, raw source) |
 | `repo_context_refs` | No | `""` | Comma-separated paths to additional internal context files/directories |

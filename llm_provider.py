@@ -7,6 +7,7 @@ and extended thinking according to its native API.
 
 import json
 import logging
+import random
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -106,9 +107,9 @@ class LLMProvider(ABC):
                         raise
                     if not self._is_retryable(e):
                         raise
-                    wait_time = 2 ** (attempt + 1)
+                    wait_time = 2 ** (attempt + 1) + random.random()
                     if _is_rate_limit_generic(e):
-                        wait_time = max(wait_time, 15)
+                        wait_time = max(wait_time, 15) + random.uniform(0, 2)
                     logging.warning(f"Retryable API error (attempt {attempt + 1}/{self.max_retries}): {e}")
                     time.sleep(wait_time)
 
@@ -158,6 +159,8 @@ class GeminiProvider(LLMProvider):
                 native.append(self._types.Part.from_bytes(
                     data=part.data, mime_type=part.mime_type or "image/png"
                 ))
+            else:
+                logging.warning(f"Unknown ContentPart type '{part.type}' — skipping")
         return native
 
     def _generate_once(self, model, contents, schema, thinking_budget=None, cache_name=None):
@@ -251,6 +254,8 @@ class AnthropicProvider(LLMProvider):
                         "data": base64.standard_b64encode(part.data).decode("utf-8"),
                     },
                 })
+            else:
+                logging.warning(f"Unknown ContentPart type '{part.type}' — skipping")
         # Strip None cache_control fields
         for block in blocks:
             if isinstance(block, dict) and block.get("cache_control") is None:
@@ -289,8 +294,9 @@ class AnthropicProvider(LLMProvider):
         if hasattr(response, 'usage'):
             usage.input_tokens = getattr(response.usage, 'input_tokens', 0) or 0
             usage.output_tokens = getattr(response.usage, 'output_tokens', 0) or 0
-            # Anthropic reports thinking tokens via cache_creation_input_tokens when thinking is enabled
-            usage.thinking_tokens = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
+            # Anthropic does not expose thinking tokens in the usage object;
+            # cache_creation_input_tokens is for prompt caching, not thinking.
+            # We leave thinking_tokens as 0 for Anthropic.
 
         return parsed, usage
 
@@ -305,7 +311,7 @@ class AnthropicProvider(LLMProvider):
 
     def _is_retryable(self, error: Exception) -> bool:
         error_str = str(error).lower()
-        if any(s in error_str for s in ['529', 'overloaded', '529']):
+        if any(s in error_str for s in ['529', 'overloaded']):
             return True
         return _is_retryable_generic(error)
 
@@ -340,6 +346,8 @@ class OpenAIProvider(LLMProvider):
                     "type": "image_url",
                     "image_url": {"url": f"data:{mime};base64,{b64}"}
                 })
+            else:
+                logging.warning(f"Unknown ContentPart type '{part.type}' — skipping")
         return [{"role": "user", "content": content_blocks}]
 
     def _generate_once(self, model, contents, schema, thinking_budget=None, cache_name=None):

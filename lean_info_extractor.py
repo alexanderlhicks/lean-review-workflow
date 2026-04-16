@@ -193,7 +193,7 @@ def extract_info_for_files(changed_files: List[str], time_budget: int = 300) -> 
             # Extract compiler diagnostics if time permits
             remaining_budget = time_budget - (_time.monotonic() - start)
             if remaining_budget > 60:
-                diags = extract_diagnostics(file_path, timeout=min(60, int(remaining_budget)))
+                diags = extract_diagnostics(file_path, timeout=max(1, min(60, int(remaining_budget))))
                 file_info["diagnostics"] = diags
                 results["diagnostics"].extend(diags)
 

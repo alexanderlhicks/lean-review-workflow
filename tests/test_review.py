@@ -17,6 +17,8 @@ from review import (
     _get_diff_lines,
     _load_prompt,
     _validate_url,
+    _check_ip_safe,
+    _resolve_and_validate,
 )
 from lean_utils import is_in_comment
 from llm_provider import (
@@ -307,9 +309,62 @@ class TestValidateUrl:
             "review.socket.getaddrinfo",
             lambda host, port: [(None, None, None, None, ("169.254.169.254", 0))]
         )
-        is_safe, reason = _validate_url("https://example.com/spec.pdf")
+        is_safe, reason, _ = _resolve_and_validate("https://example.com/spec.pdf")
         assert is_safe is False
-        assert "dns" in reason.lower() or "private" in reason.lower()
+        assert "private" in reason.lower() or "cloud metadata" in reason.lower()
+
+
+class TestCheckIpSafe:
+    def test_public_ip(self):
+        is_safe, _ = _check_ip_safe("93.184.216.34")
+        assert is_safe is True
+
+    def test_private_ip(self):
+        is_safe, reason = _check_ip_safe("192.168.1.1")
+        assert is_safe is False
+        assert "private" in reason.lower()
+
+    def test_aws_metadata_ip(self):
+        is_safe, reason = _check_ip_safe("169.254.169.254")
+        assert is_safe is False
+
+    def test_azure_metadata_ip(self):
+        is_safe, reason = _check_ip_safe("168.63.129.16")
+        assert is_safe is False
+        assert "cloud metadata" in reason.lower()
+
+    def test_alibaba_metadata_ip(self):
+        is_safe, reason = _check_ip_safe("100.100.100.200")
+        assert is_safe is False
+        assert "cloud metadata" in reason.lower()
+
+    def test_loopback(self):
+        is_safe, reason = _check_ip_safe("127.0.0.1")
+        assert is_safe is False
+
+
+class TestResolveAndValidate:
+    def test_safe_url(self, monkeypatch):
+        monkeypatch.setattr(
+            "review.socket.getaddrinfo",
+            lambda host, port: [(None, None, None, None, ("93.184.216.34", 0))]
+        )
+        is_safe, reason, ips = _resolve_and_validate("https://example.com/file.pdf")
+        assert is_safe is True
+        assert "93.184.216.34" in ips
+
+    def test_dns_resolves_to_private(self, monkeypatch):
+        monkeypatch.setattr(
+            "review.socket.getaddrinfo",
+            lambda host, port: [(None, None, None, None, ("10.0.0.1", 0))]
+        )
+        is_safe, reason, _ = _resolve_and_validate("https://example.com/file.pdf")
+        assert is_safe is False
+
+    def test_ip_url_skips_dns(self):
+        is_safe, reason, ips = _resolve_and_validate("https://93.184.216.34/file.pdf")
+        assert is_safe is True
+        assert "93.184.216.34" in ips
 
 
 class TestExternalFetch:

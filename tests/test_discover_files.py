@@ -12,6 +12,7 @@ from discover_files import (
     get_dependency_lean_files,
     get_transitive_dependencies,
     convert_module_to_file_path,
+    build_lean_file_index,
 )
 from lean_utils import file_path_to_module_name
 
@@ -147,3 +148,41 @@ class TestTransitiveDependencies:
         assert result["D"] == 2
         # F is reachable at depth 3 (A->B->D->F or A->C->D->F)
         assert result["F"] == 3
+
+
+class TestBuildLeanFileIndex:
+    def test_finds_lean_files(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "Foo.lean").write_text("def foo := 1")
+        (tmp_path / "src" / "Bar.lean").write_text("def bar := 1")
+        (tmp_path / "README.md").write_text("hello")
+        index = build_lean_file_index()
+        assert any("Foo.lean" in f for f in index)
+        assert any("Bar.lean" in f for f in index)
+        assert not any("README.md" in f for f in index)
+
+    def test_skips_git_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        git_dir = tmp_path / ".git" / "objects"
+        git_dir.mkdir(parents=True)
+        (git_dir / "Fake.lean").write_text("-- not a real lean file")
+        (tmp_path / "Real.lean").write_text("def real := 1")
+        index = build_lean_file_index()
+        assert not any(".git" in f for f in index)
+        assert any("Real.lean" in f for f in index)
+
+    def test_skips_lake_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        lake_dir = tmp_path / ".lake" / "packages"
+        lake_dir.mkdir(parents=True)
+        (lake_dir / "Dep.lean").write_text("-- dependency")
+        (tmp_path / "Main.lean").write_text("def main := 1")
+        index = build_lean_file_index()
+        assert not any(".lake" in f for f in index)
+        assert any("Main.lean" in f for f in index)
+
+    def test_empty_directory(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        index = build_lean_file_index()
+        assert index == []
