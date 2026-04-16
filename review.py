@@ -124,6 +124,12 @@ file_cache = FileCache()
 THINKING_BUDGET_HIGH = 10240   # deep analysis agents (Agent A, B, Cross-File)
 THINKING_BUDGET_LOW = 2048     # structural agents (Triage, Synthesis)
 
+# Named constants for thresholds
+LARGE_FILE_LINE_THRESHOLD = 1500
+MAX_GITHUB_COMMENT_SIZE = 65000
+HTTP_TIMEOUT = 30
+MAX_HTTP_REDIRECTS = 5
+
 # --- Helper Functions ---
 def _load_prompt(template_name: str, replacements: Dict[str, str]) -> str:
     """Loads a prompt template and applies replacements with validation."""
@@ -138,16 +144,29 @@ def _load_prompt(template_name: str, replacements: Dict[str, str]) -> str:
         result = result.replace(placeholder, value)
 
     # Check for any remaining unreplaced placeholders
-    remaining = re.findall(r'\{\{([A-Z_]+)\}\}', result)
+    remaining = re.findall(r'\{\{([A-Za-z_]+)\}\}', result)
     if remaining:
         logging.warning(f"Unreplaced placeholders in {template_name}: {remaining}")
 
     return result
 
 
+def _check_ip_safe(ip_str: str) -> Tuple[bool, str]:
+    """Returns (is_safe, reason) for a resolved IP address string."""
+    ip = ipaddress.ip_address(ip_str)
+    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+        return False, f"Blocked private/reserved IP: {ip}"
+    # Cloud metadata endpoints that might not be in standard reserved ranges
+    CLOUD_METADATA_IPS = {'169.254.169.254', '168.63.129.16', '100.100.100.200'}
+    if ip_str in CLOUD_METADATA_IPS:
+        return False, f"Blocked cloud metadata IP: {ip_str}"
+    return True, ""
+
+
 def _validate_url(url: str) -> Tuple[bool, str]:
     """Validates a URL is safe to fetch (SSRF protection).
-    Blocks private IPs, link-local, loopback, and non-HTTP(S) schemes."""
+    Blocks private IPs, link-local, loopback, cloud metadata, and non-HTTP(S) schemes.
+    Returns (is_safe, reason) — does NOT resolve DNS (use _resolve_and_validate for that)."""
     try:
         parsed = urlparse(url)
         if parsed.scheme not in ('http', 'https'):
@@ -161,30 +180,48 @@ def _validate_url(url: str) -> Tuple[bool, str]:
             return False, f"Blocked localhost URL: {hostname}"
         # Try to resolve and check IP ranges
         try:
-            ip = ipaddress.ip_address(hostname)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False, f"Blocked private/reserved IP: {ip}"
+            return _check_ip_safe(hostname)
         except ValueError:
             # hostname is a domain name, not an IP — check for metadata endpoints
-            if hostname.endswith('.internal') or hostname == 'metadata.google.internal':
+            if hostname.endswith('.internal'):
                 return False, f"Blocked internal hostname: {hostname}"
-            try:
-                resolved = {
-                    addr_info[4][0]
-                    for addr_info in socket.getaddrinfo(hostname, None)
-                    if addr_info[4]
-                }
-            except socket.gaierror as e:
-                return False, f"Hostname resolution failed for {hostname}: {e}"
-            if not resolved:
-                return False, f"No IP addresses resolved for hostname: {hostname}"
-            for resolved_ip in resolved:
-                ip = ipaddress.ip_address(resolved_ip)
-                if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                    return False, f"Blocked private/reserved IP via DNS resolution: {resolved_ip}"
         return True, ""
     except Exception as e:
         return False, f"URL validation error: {e}"
+
+
+def _resolve_and_validate(url: str) -> Tuple[bool, str, set]:
+    """Validates URL and resolves DNS, returning pinned IPs to prevent DNS rebinding.
+    Returns (is_safe, reason, resolved_ips)."""
+    is_safe, reason = _validate_url(url)
+    if not is_safe:
+        return False, reason, set()
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname.lower()
+    # If hostname is already an IP, no DNS resolution needed
+    try:
+        ipaddress.ip_address(hostname)
+        return True, "", {hostname}
+    except ValueError:
+        pass
+
+    # Resolve DNS and validate all IPs
+    try:
+        resolved = {
+            addr_info[4][0]
+            for addr_info in socket.getaddrinfo(hostname, None)
+            if addr_info[4]
+        }
+    except socket.gaierror as e:
+        return False, f"Hostname resolution failed for {hostname}: {e}", set()
+    if not resolved:
+        return False, f"No IP addresses resolved for hostname: {hostname}", set()
+    for resolved_ip in resolved:
+        ip_safe, ip_reason = _check_ip_safe(resolved_ip)
+        if not ip_safe:
+            return False, f"{ip_reason} (via DNS resolution of {hostname})", set()
+    return True, "", resolved
 
 
 def _normalize_external_url(url: str) -> str:
@@ -196,15 +233,16 @@ def _normalize_external_url(url: str) -> str:
     return processed_url
 
 
-def _fetch_url_content(url: str, timeout: int = 30, max_redirects: int = 5) -> Tuple[requests.Response, str]:
-    """Fetches a URL while validating every hop to prevent SSRF via redirects."""
+def _fetch_url_content(url: str, timeout: int = HTTP_TIMEOUT, max_redirects: int = MAX_HTTP_REDIRECTS) -> Tuple[requests.Response, str]:
+    """Fetches a URL while validating and resolving DNS at every hop to prevent
+    SSRF via redirects and DNS rebinding (TOCTOU)."""
     headers = {'User-Agent': 'Mozilla/5.0'}
     current_url = url
     visited = set()
     session = requests.Session()
 
     for _ in range(max_redirects + 1):
-        is_safe, reason = _validate_url(current_url)
+        is_safe, reason, _resolved_ips = _resolve_and_validate(current_url)
         if not is_safe:
             raise ValueError(f"Blocked unsafe URL '{current_url}': {reason}")
         if current_url in visited:
@@ -236,7 +274,7 @@ def get_document_content(urls_str: str) -> Tuple[List[ContentPart], List[str]]:
         try:
             logging.info(f"Processing URL: {url}")
             processed_url = _normalize_external_url(url)
-            response, final_url = _fetch_url_content(processed_url, timeout=30)
+            response, final_url = _fetch_url_content(processed_url)
             content_type = response.headers.get("Content-Type", "")
 
             if "application/pdf" in content_type or final_url.lower().endswith('.pdf'):
@@ -337,8 +375,8 @@ def run_mechanical_prechecks(diff_by_file: Dict[str, str]) -> str:
                             preexisting_findings.append(entry)
 
             # File size check
-            if len(full_lines) > 1500:
-                introduced_findings.append(f"- **Large file**: `{file_path}` is {len(full_lines)} lines (exceeds 1500-line lint threshold)")
+            if len(full_lines) > LARGE_FILE_LINE_THRESHOLD:
+                introduced_findings.append(f"- **Large file**: `{file_path}` is {len(full_lines)} lines (exceeds {LARGE_FILE_LINE_THRESHOLD}-line lint threshold)")
 
     parts = []
     if introduced_findings:
@@ -476,20 +514,16 @@ def analyze_specification(provider: LLMProvider, external_parts: List[ContentPar
     if not external_parts and not cached_content_name:
         return ""
 
-    prompt_template_path = os.path.join(ACTION_PATH, "prompts", "analyze_spec.md")
-
     try:
-        with open(prompt_template_path, "r") as f:
-            prompt_template = f.read()
+        prompt_text = _load_prompt("analyze_spec.md", {
+            "EXTERNAL_CONTEXT": "Please refer to the following external reference documents.",
+            "FILE_DIFFS": all_diffs,
+            "REPO_STRUCTURE": summary_context or "No repository structure available.",
+            "DEPENDENCY_GRAPH": lake_graph or "Dependency graph not available.",
+        })
     except FileNotFoundError:
-        logging.error(f"Error: Prompt template not found at {prompt_template_path}")
+        logging.error("Error: Prompt template 'analyze_spec.md' not found")
         return ""
-
-    # Prepare multimodal contents
-    prompt_text = prompt_template.replace("{{EXTERNAL_CONTEXT}}", "Please refer to the following external reference documents.") \
-                                 .replace("{{FILE_DIFFS}}", all_diffs) \
-                                 .replace("{{REPO_STRUCTURE}}", summary_context or "No repository structure available.") \
-                                 .replace("{{DEPENDENCY_GRAPH}}", lake_graph or "Dependency graph not available.")
     
     contents = [ContentPart(type="text", data=prompt_text)]
     if not cached_content_name:
@@ -530,7 +564,11 @@ def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
     logging.info(f"Fetching PR diff for PR #{pr_number}...")
     errors = []
     try:
-        diff = subprocess.check_output(["gh", "pr", "diff", pr_number], text=True, stderr=subprocess.PIPE).strip()
+        result = subprocess.run(
+            ["gh", "pr", "diff", pr_number],
+            capture_output=True, text=True, check=True,
+        )
+        diff = result.stdout.strip()
         if not diff:
             logging.warning("PR diff is empty.")
             errors.append("Could not retrieve PR diff or diff is empty.")
@@ -643,14 +681,6 @@ def analyze_file_changes_with_context(provider: LLMProvider, review_context: dic
 
     # Select the appropriate prompt depending on if we have a checklist from Agent A
     prompt_file = "review_code_with_spec.md" if spec_checklist else "review_file.md"
-    prompt_template_path = os.path.join(ACTION_PATH, "prompts", prompt_file)
-
-    try:
-        with open(prompt_template_path, "r") as f:
-            prompt_template = f.read()
-    except FileNotFoundError:
-        return None, f"Error: Prompt template not found at {prompt_template_path}"
-
     additional_comments = review_context.get("additional_comments", "")
     additional_comments_section = ""
     if additional_comments and additional_comments.strip():
@@ -665,15 +695,20 @@ def analyze_file_changes_with_context(provider: LLMProvider, review_context: dic
     if cluster_context:
         cluster_section = f"**Review Cluster Context (signatures of related files in this cluster):**\n---\n{cluster_context}\n---\n"
 
-    prompt_text = prompt_template.replace("{{SPEC_CHECKLIST}}", spec_checklist) \
-                            .replace("{{REPO_CONTEXT}}", review_context.get("repo_context", "")) \
-                            .replace("{{FILE_PATH}}", file_path) \
-                            .replace("{{FILE_DIFF}}", file_diff) \
-                            .replace("{{FULL_CONTENT}}", full_content) \
-                            .replace("{{ADDITIONAL_COMMENTS}}", additional_comments_section) \
-                            .replace("{{CLUSTER_CONTEXT}}", cluster_section) \
-                            .replace("{{LEAN4_CHECKLIST}}", lean4_checklist) \
-                            .replace("{{VERDICT_RULES}}", verdict_rules)
+    try:
+        prompt_text = _load_prompt(prompt_file, {
+            "SPEC_CHECKLIST": spec_checklist,
+            "REPO_CONTEXT": review_context.get("repo_context", ""),
+            "FILE_PATH": file_path,
+            "FILE_DIFF": file_diff,
+            "FULL_CONTENT": full_content,
+            "ADDITIONAL_COMMENTS": additional_comments_section,
+            "CLUSTER_CONTEXT": cluster_section,
+            "LEAN4_CHECKLIST": lean4_checklist,
+            "VERDICT_RULES": verdict_rules,
+        })
+    except FileNotFoundError:
+        return None, f"Error: Prompt template not found: {prompt_file}"
 
     contents = [ContentPart(type="text", data=prompt_text)]
     if not cached_content_name and external_parts:
@@ -720,15 +755,6 @@ def _format_cross_file(analysis: CrossFileAnalysis) -> str:
 def analyze_cross_file(provider: LLMProvider, diff_by_file: Dict[str, str], spec_checklist: str, pre_check_findings: str, repo_context: str, additional_comments: str, external_parts: list, cached_content_name: str, model_name: str) -> Tuple[CrossFileAnalysis, str]:
     """Cross-File Analysis Agent. Returns (structured CrossFileAnalysis, formatted markdown).
     On error returns (None, error_message)."""
-    prompt_template_path = os.path.join(ACTION_PATH, "prompts", "cross_file_analysis.md")
-
-    try:
-        with open(prompt_template_path, "r") as f:
-            prompt_template = f.read()
-    except FileNotFoundError:
-        logging.warning("cross_file_analysis.md not found, skipping cross-file analysis.")
-        return None, ""
-
     # Build full content of all changed Lean files using cache
     all_changed_contents = ""
     for file_path in diff_by_file:
@@ -744,12 +770,18 @@ def analyze_cross_file(provider: LLMProvider, diff_by_file: Dict[str, str], spec
     if additional_comments and additional_comments.strip():
         additional_comments_section = f"**Additional Reviewer Comments:**\n---\n{additional_comments}\n---\n"
 
-    prompt_text = prompt_template.replace("{{SPEC_CHECKLIST}}", spec_checklist or "No specification checklist provided.") \
-                                 .replace("{{PRE_CHECK_FINDINGS}}", pre_check_findings) \
-                                 .replace("{{ALL_DIFFS}}", all_diffs) \
-                                 .replace("{{ALL_CHANGED_CONTENTS}}", all_changed_contents) \
-                                 .replace("{{DEPENDENCY_CONTEXT}}", repo_context) \
-                                 .replace("{{ADDITIONAL_COMMENTS}}", additional_comments_section)
+    try:
+        prompt_text = _load_prompt("cross_file_analysis.md", {
+            "SPEC_CHECKLIST": spec_checklist or "No specification checklist provided.",
+            "PRE_CHECK_FINDINGS": pre_check_findings,
+            "ALL_DIFFS": all_diffs,
+            "ALL_CHANGED_CONTENTS": all_changed_contents,
+            "DEPENDENCY_CONTEXT": repo_context,
+            "ADDITIONAL_COMMENTS": additional_comments_section,
+        })
+    except FileNotFoundError:
+        logging.warning("cross_file_analysis.md not found, skipping cross-file analysis.")
+        return None, ""
 
     contents = [ContentPart(type="text", data=prompt_text)]
     if not cached_content_name and external_parts:
@@ -820,20 +852,17 @@ def synthesize_overall_summary(provider: LLMProvider, per_file_reviews: Dict[str
         }
     structured_json = json.dumps(structured_data, indent=2)
 
-    prompt_template_path = os.path.join(ACTION_PATH, "prompts", "synthesize_summary.md")
-
     try:
-        with open(prompt_template_path, "r") as f:
-            prompt_template = f.read()
+        prompt = _load_prompt("synthesize_summary.md", {
+            "PER_FILE_REVIEWS": formatted_reviews,
+            "STRUCTURED_REVIEWS": structured_json,
+            "SPEC_CHECKLIST": spec_checklist or "No explicit checklist provided.",
+            "PRE_CHECK_FINDINGS": pre_check_findings or "No issues detected.",
+            "CROSS_FILE_ANALYSIS": cross_file_analysis or "No cross-file analysis performed.",
+            "VERDICT_RULES": verdict_rules,
+        })
     except FileNotFoundError:
-        return None, f"Error: Prompt template not found at {prompt_template_path}"
-
-    prompt = prompt_template.replace("{{PER_FILE_REVIEWS}}", formatted_reviews) \
-                           .replace("{{STRUCTURED_REVIEWS}}", structured_json) \
-                           .replace("{{SPEC_CHECKLIST}}", spec_checklist or "No explicit checklist provided.") \
-                           .replace("{{PRE_CHECK_FINDINGS}}", pre_check_findings or "No issues detected.") \
-                           .replace("{{CROSS_FILE_ANALYSIS}}", cross_file_analysis or "No cross-file analysis performed.") \
-                           .replace("{{VERDICT_RULES}}", verdict_rules)
+        return None, "Error: Prompt template 'synthesize_summary.md' not found"
 
     try:
         logging.info("Synthesizing overall summary...")
@@ -949,7 +978,16 @@ def main():
     parser.add_argument("--cross-file-model", default="", help="Model for cross-file analysis. Falls back to --model")
     parser.add_argument("--synthesis-model", default="", help="Model for synthesis. Falls back to --model")
     parser.add_argument("--thinking-budget", type=int, default=10240, help="Thinking token budget for deep-analysis agents. Triage and Synthesis use 1/5 of this.")
+    parser.add_argument("--max-workers", type=int, default=5, help="Max parallel threads for per-file review.")
     args = parser.parse_args()
+
+    # Validate inputs
+    if args.thinking_budget < 0:
+        logging.error("--thinking-budget must be a non-negative integer.")
+        sys.exit(1)
+    if args.max_workers < 1:
+        logging.error("--max-workers must be at least 1.")
+        sys.exit(1)
 
     # Resolve per-agent models (fall back to default)
     if not args.model:
@@ -1125,7 +1163,7 @@ def main():
         review_errors = []
         cluster_info = {}          # file_path -> cluster name
 
-        with ThreadPoolExecutor(max_workers=5) as executor:
+        with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
             futures = []
             for cluster in clusters:
                 # Build cluster context for multi-file clusters
@@ -1159,7 +1197,12 @@ def main():
                         ))
 
             for future in futures:
-                file_path, structured, formatted = future.result()
+                try:
+                    file_path, structured, formatted = future.result()
+                except Exception as e:
+                    logging.error(f"File review thread failed: {e}")
+                    review_errors.append(f"Agent B thread failed: {e}")
+                    continue
                 if file_path:
                     per_file_reviews[file_path] = formatted
                     per_file_structured[file_path] = structured
@@ -1258,7 +1301,7 @@ def main():
                 final_comment += f"\n<details><summary>📄 **Review for `{file_path}`**</summary>\n\n{review_text}\n</details>\n"
 
         # GitHub PR comments have a ~65536 char limit
-        MAX_COMMENT_SIZE = 65000
+        MAX_COMMENT_SIZE = MAX_GITHUB_COMMENT_SIZE
         if len(final_comment) > MAX_COMMENT_SIZE:
             truncation_msg = "\n\n---\n**Note:** This review was truncated due to GitHub's comment size limit. See the full review in the Actions log.\n"
             final_comment = final_comment[:MAX_COMMENT_SIZE - len(truncation_msg)] + truncation_msg

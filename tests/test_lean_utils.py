@@ -6,7 +6,7 @@ import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from lean_utils import file_path_to_module_name, is_in_comment, FileCache
+from lean_utils import file_path_to_module_name, is_in_comment, FileCache, detect_src_dir
 
 
 # --- file_path_to_module_name ---
@@ -153,3 +153,32 @@ class TestFileCache:
     def test_readlines_nonexistent(self):
         cache = FileCache()
         assert cache.readlines("/nonexistent/path.lean") is None
+
+
+# --- detect_src_dir ---
+
+class TestDetectSrcDir:
+    def test_lakefile_toml(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "lakefile.toml").write_text('srcDir = "MyLib"\n')
+        assert detect_src_dir() == "MyLib"
+
+    def test_lakefile_lean(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "lakefile.lean").write_text('srcDir := "ArkLib"\n')
+        assert detect_src_dir() == "ArkLib"
+
+    def test_no_lakefile(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        assert detect_src_dir() is None
+
+    def test_toml_takes_precedence(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "lakefile.toml").write_text('srcDir = "FromToml"\n')
+        (tmp_path / "lakefile.lean").write_text('srcDir := "FromLean"\n')
+        assert detect_src_dir() == "FromToml"
+
+    def test_lakefile_without_src_dir(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "lakefile.toml").write_text('name = "myProject"\n')
+        assert detect_src_dir() is None

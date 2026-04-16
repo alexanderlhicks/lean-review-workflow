@@ -69,7 +69,8 @@ def get_transitive_dependencies(changed_modules, lake_graph_json, max_depth=2):
 def build_lean_file_index():
     index = []
     for root, dirs, files in os.walk('.'):
-        if '.git' in root or '__pycache__' in root:
+        parts = root.split(os.sep)
+        if '.git' in parts or '__pycache__' in parts or '.lake' in parts:
             continue
         for f in files:
             if f.endswith('.lean'):
@@ -147,9 +148,7 @@ def main():
     others = [f for f in final_file_list if f not in changed_files]
 
     # Sort others: depth-1 (direct dependents + direct deps) before depth-2+ (transitive)
-    def _file_priority(fp):
-        return dep_files_with_depth.get(fp, 1)  # dependents (not in dep map) default to depth 1
-    others.sort(key=_file_priority)
+    others.sort(key=lambda fp: (dep_files_with_depth.get(fp, 1), fp))
 
     full_context_files = changed_first + others[:max(0, CONTEXT_LIMIT - len(changed_first))]
     summary_context_files = others[max(0, CONTEXT_LIMIT - len(changed_first)):]

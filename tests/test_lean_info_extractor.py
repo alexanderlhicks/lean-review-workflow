@@ -10,6 +10,8 @@ from lean_info_extractor import (
     get_lean_declarations,
     get_module_name,
     extract_sorry_warnings,
+    extract_diagnostics,
+    extract_info_for_files,
     extract_light_info,
     format_for_review,
     main,
@@ -51,13 +53,13 @@ noncomputable def myNonComp := Classical.choice ⟨0⟩
 
 
 class TestGetModuleName:
-    def test_with_src_prefix(self, tmp_path):
+    def test_with_src_prefix(self, tmp_path, monkeypatch):
         # Without lakefile, falls back to heuristic
-        os.chdir(tmp_path)
+        monkeypatch.chdir(tmp_path)
         assert get_module_name("src/Foo/Bar.lean") == "Foo.Bar"
 
-    def test_with_lakefile_toml(self, tmp_path):
-        os.chdir(tmp_path)
+    def test_with_lakefile_toml(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
         (tmp_path / "lakefile.toml").write_text('srcDir = "ArkLib"\n')
         assert get_module_name("ArkLib/Crypto/Hash.lean") == "Crypto.Hash"
 
@@ -132,6 +134,51 @@ class TestFormatForReview:
         }
         result = format_for_review(info)
         assert "myCustomAxiom" in result
+
+
+class TestExtractDiagnostics:
+    def test_returns_empty_when_lake_not_available(self):
+        """extract_diagnostics should not crash when lake is not available."""
+        result = extract_diagnostics("/nonexistent/file.lean", timeout=5)
+        assert isinstance(result, list)
+
+    def test_returns_list(self, tmp_path):
+        """Should always return a list (possibly empty)."""
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text("def foo := 1\n")
+        result = extract_diagnostics(str(lean_file), timeout=5)
+        assert isinstance(result, list)
+
+
+class TestExtractInfoForFiles:
+    def test_skips_non_lean(self, tmp_path):
+        md_file = tmp_path / "README.md"
+        md_file.write_text("hello")
+        result = extract_info_for_files([str(md_file)], time_budget=10)
+        assert result["files"] == {}
+
+    def test_skips_nonexistent(self):
+        result = extract_info_for_files(["/nonexistent/file.lean"], time_budget=10)
+        assert result["files"] == {}
+
+    def test_basic_lean_file(self, tmp_path):
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text("def foo := 1\ntheorem bar : True := sorry\n")
+        result = extract_info_for_files([str(lean_file)], time_budget=10)
+        assert str(lean_file) in result["files"]
+        file_info = result["files"][str(lean_file)]
+        assert "foo" in file_info["declarations"]
+        assert "bar" in file_info["declarations"]
+        # Should detect sorry
+        assert any("sorry" in loc or str(lean_file) in loc for loc in result["sorry_locations"])
+
+    def test_time_budget_exceeded(self, tmp_path):
+        """Should report error when time budget is 0."""
+        lean_file = tmp_path / "Foo.lean"
+        lean_file.write_text("def foo := 1\n")
+        result = extract_info_for_files([str(lean_file)], time_budget=0)
+        assert len(result["errors"]) > 0
+        assert "Time budget" in result["errors"][0]
 
 
 class TestExtractLightInfo:
