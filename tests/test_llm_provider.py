@@ -448,6 +448,85 @@ class TestAnthropicContentConversion:
             pytest.skip("anthropic SDK not installed")
 
 
+class TestAnthropicThinking:
+    def _provider(self):
+        from llm_provider import AnthropicProvider
+        provider = AnthropicProvider.__new__(AnthropicProvider)
+        provider._thinking_warned = False
+        return provider
+
+    def test_adaptive_model_detection(self):
+        try:
+            p = self._provider()
+            assert p._is_adaptive_thinking_model("claude-opus-4-7")
+            assert p._is_adaptive_thinking_model("claude-opus-4-6")
+            assert p._is_adaptive_thinking_model("claude-sonnet-4-6")
+            assert p._is_adaptive_thinking_model("claude-mythos-preview")
+            assert not p._is_adaptive_thinking_model("claude-opus-4-5")
+            assert not p._is_adaptive_thinking_model("claude-sonnet-4-5")
+            assert not p._is_adaptive_thinking_model("claude-sonnet-3-7")
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_effort_for_budget(self):
+        try:
+            from llm_provider import AnthropicProvider
+            assert AnthropicProvider._effort_for_budget(1) == "low"
+            assert AnthropicProvider._effort_for_budget(2048) == "low"
+            assert AnthropicProvider._effort_for_budget(2049) == "medium"
+            assert AnthropicProvider._effort_for_budget(8192) == "medium"
+            assert AnthropicProvider._effort_for_budget(8193) == "high"
+            assert AnthropicProvider._effort_for_budget(10240) == "high"
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def _run_with_fake_client(self, model, thinking_budget):
+        """Run _generate_once against a stub client and return the captured kwargs."""
+        from llm_provider import AnthropicProvider
+        provider = AnthropicProvider.__new__(AnthropicProvider)
+        provider._thinking_warned = False
+        captured = {}
+        tool_input = {"verdict": "OK", "summary": ""}
+        fake_response = SimpleNamespace(
+            content=[SimpleNamespace(type="tool_use", input=tool_input)],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return fake_response
+
+        provider.client = SimpleNamespace(
+            messages=SimpleNamespace(create=fake_create)
+        )
+        provider._generate_once(
+            model, [ContentPart(type="text", data="hi")], MockReview,
+            thinking_budget=thinking_budget,
+        )
+        return captured
+
+    def test_adaptive_request_uses_output_config(self):
+        try:
+            captured = self._run_with_fake_client("claude-opus-4-7", 10240)
+            assert captured["thinking"] == {"type": "adaptive"}
+            assert captured["output_config"] == {"effort": "high"}
+            assert captured["tool_choice"] == {"type": "auto"}
+            assert "temperature" not in captured
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_non_adaptive_model_skips_thinking(self):
+        try:
+            captured = self._run_with_fake_client("claude-opus-4-5", 10240)
+            assert "thinking" not in captured
+            assert "output_config" not in captured
+            assert "temperature" not in captured
+            # Without active thinking the deterministic forced tool_choice is preserved.
+            assert captured["tool_choice"] == {"type": "tool", "name": "submit_review"}
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+
 class TestOpenAIContentConversion:
     def test_text_content(self):
         try:

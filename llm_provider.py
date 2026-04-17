@@ -253,12 +253,37 @@ class GeminiProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 
 class AnthropicProvider(LLMProvider):
-    """Anthropic Claude API provider. Uses tool use for structured output."""
+    """Anthropic Claude API provider. Uses tool use for structured output.
+
+    Scoped to adaptive-thinking models (Opus 4.7, Opus 4.6, Sonnet 4.6, Mythos),
+    which use `thinking={type: "adaptive"}` together with `output_config.effort`.
+    Older models are outside scope; if supplied, thinking is skipped with a
+    one-time warning.
+    """
+
+    _ADAPTIVE_THINKING_MODEL_PREFIXES = (
+        "claude-opus-4-7",
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-mythos",
+    )
 
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
         import anthropic
         self.client = anthropic.Anthropic(api_key=api_key)
+
+    def _is_adaptive_thinking_model(self, model: str) -> bool:
+        return model.startswith(self._ADAPTIVE_THINKING_MODEL_PREFIXES)
+
+    @staticmethod
+    def _effort_for_budget(thinking_budget: int) -> str:
+        """Map an Anthropic-style token budget to an adaptive-thinking effort level."""
+        if thinking_budget <= 2048:
+            return "low"
+        if thinking_budget <= 8192:
+            return "medium"
+        return "high"
 
     def _to_content_blocks(self, contents: List[ContentPart], cache_name: Optional[str] = None) -> list:
         """Convert ContentParts to Anthropic content blocks."""
@@ -301,10 +326,18 @@ class AnthropicProvider(LLMProvider):
         content_blocks = self._to_content_blocks(contents, cache_name)
         tool_schema = schema.model_json_schema()
 
+        use_adaptive_thinking = bool(thinking_budget) and self._is_adaptive_thinking_model(model)
+        if thinking_budget and not use_adaptive_thinking and not self._thinking_warned:
+            logging.warning(
+                f"Model '{model}' is outside the supported adaptive-thinking family "
+                f"(Opus 4.7/4.6, Sonnet 4.6, Mythos); thinking_budget will be ignored."
+            )
+            self._thinking_warned = True
+
         # Anthropic forbids forced tool_choice ('any' or specific 'tool') while
-        # extended thinking is enabled. Fall back to 'auto' in that case and
+        # extended thinking is active. Fall back to 'auto' in that case and
         # steer the model with an explicit instruction.
-        if thinking_budget:
+        if use_adaptive_thinking:
             content_blocks = content_blocks + [{
                 "type": "text",
                 "text": (
@@ -329,9 +362,9 @@ class AnthropicProvider(LLMProvider):
             'tool_choice': tool_choice,
         }
 
-        if thinking_budget:
-            kwargs['thinking'] = {'type': 'enabled', 'budget_tokens': thinking_budget}
-            kwargs['temperature'] = 1  # required when thinking is enabled
+        if use_adaptive_thinking:
+            kwargs['thinking'] = {'type': 'adaptive'}
+            kwargs['output_config'] = {'effort': self._effort_for_budget(thinking_budget)}
 
         response = self.client.messages.create(**kwargs)
 

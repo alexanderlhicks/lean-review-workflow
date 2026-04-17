@@ -213,7 +213,7 @@ jobs:
 | `additional_comments` | No | `""` | Extra focus instructions for the AI reviewer |
 | `lint` | No | `false` | Whether to run the Lean linter |
 | `dependency_depth` | No | `2` | Depth of transitive dependency traversal (1=direct only, 2=imports of imports) |
-| `thinking_budget` | No | `10240` | Thinking token budget for deep-analysis agents. Passed directly to Anthropic. On OpenAI, mapped to `reasoning.effort` (low/medium/high) for reasoning-capable models (o1/o3/o4/gpt-5). On Gemini 3, mapped to `ThinkingConfig.thinking_level` (low/medium/high). |
+| `thinking_budget` | No | `10240` | Thinking token budget for deep-analysis agents. On Anthropic: mapped to `output_config.effort` (low/medium/high) for adaptive-thinking models (Opus 4.7/4.6, Sonnet 4.6, Mythos); ignored with warning on other models. On OpenAI: mapped to `reasoning.effort` for reasoning-capable models (o1/o3/o4/gpt-5). On Gemini 3: mapped to `ThinkingConfig.thinking_level`. |
 | `spec_model` | No | `model` | Model override for the Specification Analyst agent |
 | `triage_model` | No | `model` | Model override for the Triage agent |
 | `review_model` | No | `model` | Model override for the per-file Code Reviewer agent |
@@ -226,7 +226,7 @@ jobs:
 |---------|--------|-------------------|--------------|
 | Structured output | Native schema | Tool use pattern | Native schema (Responses API `text_format`) |
 | Native PDF | Yes | Yes (document blocks) | Yes (`input_file` via Responses API) |
-| Extended thinking | `ThinkingConfig.thinking_level` (Gemini 3 only) | Thinking blocks | `reasoning.effort` on reasoning models (o1/o3/o4/gpt-5); ignored with warning on non-reasoning models |
+| Extended thinking | `ThinkingConfig.thinking_level` (Gemini 3 only) | Adaptive `output_config.effort` (Opus 4.7/4.6, Sonnet 4.6, Mythos only); ignored with warning on other models | `reasoning.effort` on reasoning models (o1/o3/o4/gpt-5); ignored with warning on non-reasoning models |
 | Content caching | Server-side (TTL) | Per-request (ephemeral) | Automatic |
 
 ## Project Structure
