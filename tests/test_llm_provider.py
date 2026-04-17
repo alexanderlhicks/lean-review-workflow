@@ -327,6 +327,44 @@ class TestGeminiContentConversion:
         except ImportError:
             pytest.skip("google-genai SDK not installed")
 
+    def test_pdf_content(self):
+        try:
+            from llm_provider import GeminiProvider
+            from google.genai import types
+            provider = GeminiProvider.__new__(GeminiProvider)
+            provider._types = types
+            parts = [ContentPart(type="pdf", data=b"%PDF-1.4 dummy", mime_type="application/pdf")]
+            native = provider._to_native_contents(parts)
+            assert len(native) == 1
+            assert isinstance(native[0], types.Part)
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_image_content(self):
+        try:
+            from llm_provider import GeminiProvider
+            from google.genai import types
+            provider = GeminiProvider.__new__(GeminiProvider)
+            provider._types = types
+            parts = [ContentPart(type="image", data=b"\x89PNG", mime_type="image/png")]
+            native = provider._to_native_contents(parts)
+            assert len(native) == 1
+            assert isinstance(native[0], types.Part)
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_unknown_type_logs_warning(self, caplog):
+        try:
+            from llm_provider import GeminiProvider
+            from google.genai import types
+            provider = GeminiProvider.__new__(GeminiProvider)
+            provider._types = types
+            with caplog.at_level("WARNING"):
+                provider._to_native_contents([ContentPart(type="mystery", data="x")])
+            assert any("mystery" in rec.message for rec in caplog.records)
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
 
 class TestGeminiThinking:
     def _provider(self):
@@ -444,6 +482,57 @@ class TestAnthropicContentConversion:
             ]
             blocks = provider._to_content_blocks(parts)
             assert len(blocks) == 1
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_pdf_content(self):
+        try:
+            from llm_provider import AnthropicProvider
+            provider = AnthropicProvider.__new__(AnthropicProvider)
+            parts = [ContentPart(type="pdf", data=b"%PDF-1.4", mime_type="application/pdf")]
+            blocks = provider._to_content_blocks(parts)
+            assert len(blocks) == 1
+            block = blocks[0]
+            assert block["type"] == "document"
+            assert block["source"]["type"] == "base64"
+            assert block["source"]["media_type"] == "application/pdf"
+            assert isinstance(block["source"]["data"], str)
+            assert "cache_control" not in block  # stripped when caching is off
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_pdf_content_with_cache(self):
+        try:
+            from llm_provider import AnthropicProvider
+            provider = AnthropicProvider.__new__(AnthropicProvider)
+            parts = [ContentPart(type="pdf", data=b"%PDF-1.4")]
+            blocks = provider._to_content_blocks(parts, cache_name="__anthropic_prompt_cache__")
+            assert blocks[0]["cache_control"] == {"type": "ephemeral"}
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_image_content(self):
+        try:
+            from llm_provider import AnthropicProvider
+            provider = AnthropicProvider.__new__(AnthropicProvider)
+            parts = [ContentPart(type="image", data=b"\x89PNG", mime_type="image/png")]
+            blocks = provider._to_content_blocks(parts)
+            assert len(blocks) == 1
+            block = blocks[0]
+            assert block["type"] == "image"
+            assert block["source"]["type"] == "base64"
+            assert block["source"]["media_type"] == "image/png"
+            assert isinstance(block["source"]["data"], str)
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_unknown_type_logs_warning(self, caplog):
+        try:
+            from llm_provider import AnthropicProvider
+            provider = AnthropicProvider.__new__(AnthropicProvider)
+            with caplog.at_level("WARNING"):
+                provider._to_content_blocks([ContentPart(type="mystery", data="x")])
+            assert any("mystery" in rec.message for rec in caplog.records)
         except ImportError:
             pytest.skip("anthropic SDK not installed")
 
@@ -576,6 +665,16 @@ class TestOpenAIContentConversion:
         except ImportError:
             pytest.skip("openai SDK not installed")
 
+    def test_unknown_type_logs_warning(self, caplog):
+        try:
+            from llm_provider import OpenAIProvider
+            provider = OpenAIProvider.__new__(OpenAIProvider)
+            with caplog.at_level("WARNING"):
+                provider._to_input([ContentPart(type="mystery", data="x")])
+            assert any("mystery" in rec.message for rec in caplog.records)
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
 
 class TestOpenAIReasoning:
     def _provider(self):
@@ -606,6 +705,383 @@ class TestOpenAIReasoning:
             assert OpenAIProvider._effort_for_budget(8192) == "medium"
             assert OpenAIProvider._effort_for_budget(8193) == "high"
             assert OpenAIProvider._effort_for_budget(10240) == "high"
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+
+# --- Request-kwargs capture tests ---
+# These tests drive each provider's _generate_once against a SimpleNamespace
+# client and assert the exact request payload. They catch regressions where
+# an API field is renamed, dropped, or shaped incorrectly.
+
+
+class TestGeminiRequestKwargs:
+    def _run(self, model, thinking_budget=None, cache_name=None):
+        from llm_provider import GeminiProvider
+        from google.genai import types
+        provider = GeminiProvider.__new__(GeminiProvider)
+        provider._types = types
+        provider._thinking_warned = False
+        captured = {}
+        fake_response = SimpleNamespace(
+            parsed=MockReview(verdict="OK", summary=""),
+            text='{"verdict":"OK","summary":""}',
+            usage_metadata=SimpleNamespace(
+                prompt_token_count=10,
+                candidates_token_count=5,
+                thoughts_token_count=3,
+            ),
+        )
+
+        def fake_generate(**kwargs):
+            captured.update(kwargs)
+            return fake_response
+
+        provider.client = SimpleNamespace(
+            models=SimpleNamespace(generate_content=fake_generate)
+        )
+        provider._generate_once(
+            model,
+            [ContentPart(type="text", data="hi")],
+            MockReview,
+            thinking_budget=thinking_budget,
+            cache_name=cache_name,
+        )
+        return captured
+
+    def test_response_schema_always_set(self):
+        try:
+            captured = self._run("gemini-3-pro")
+            config = captured["config"]
+            assert config.response_mime_type == "application/json"
+            assert config.response_schema is MockReview
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    @staticmethod
+    def _level_str(level):
+        """Normalise the SDK's ThinkingLevel enum (or raw string) to a lowercase string."""
+        raw = getattr(level, "value", level)
+        return str(raw).lower()
+
+    def test_gemini_3_uses_thinking_level(self):
+        try:
+            captured = self._run("gemini-3-pro", thinking_budget=10240)
+            config = captured["config"]
+            assert config.thinking_config is not None
+            assert self._level_str(config.thinking_config.thinking_level) == "high"
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_non_gemini_3_sets_no_thinking_config(self):
+        try:
+            captured = self._run("gemini-2.5-flash", thinking_budget=10240)
+            config = captured["config"]
+            assert config.thinking_config is None
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_no_thinking_config_when_budget_zero(self):
+        try:
+            captured = self._run("gemini-3-pro", thinking_budget=0)
+            config = captured["config"]
+            assert config.thinking_config is None
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_cached_content_passed_to_config(self):
+        try:
+            captured = self._run("gemini-3-pro", cache_name="cachedContents/abc")
+            config = captured["config"]
+            assert config.cached_content == "cachedContents/abc"
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+
+class TestGeminiTokenUsage:
+    def _run_with_response(self, response):
+        from llm_provider import GeminiProvider
+        from google.genai import types
+        provider = GeminiProvider.__new__(GeminiProvider)
+        provider._types = types
+        provider._thinking_warned = False
+        provider.client = SimpleNamespace(
+            models=SimpleNamespace(generate_content=lambda **k: response)
+        )
+        _, tok = provider._generate_once(
+            "gemini-3-pro",
+            [ContentPart(type="text", data="hi")],
+            MockReview,
+        )
+        return tok
+
+    def test_populated_from_usage_metadata(self):
+        try:
+            response = SimpleNamespace(
+                parsed=MockReview(verdict="OK"),
+                text='{"verdict":"OK"}',
+                usage_metadata=SimpleNamespace(
+                    prompt_token_count=100,
+                    candidates_token_count=50,
+                    thoughts_token_count=25,
+                ),
+            )
+            tok = self._run_with_response(response)
+            assert tok.input_tokens == 100
+            assert tok.output_tokens == 50
+            assert tok.thinking_tokens == 25
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_missing_usage_metadata_defaults_to_zero(self):
+        try:
+            response = SimpleNamespace(
+                parsed=MockReview(verdict="OK"),
+                text='{"verdict":"OK"}',
+                usage_metadata=None,
+            )
+            tok = self._run_with_response(response)
+            assert tok.input_tokens == 0
+            assert tok.output_tokens == 0
+            assert tok.thinking_tokens == 0
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+
+class TestAnthropicRequestShape:
+    def _run(self, model="claude-opus-4-7", thinking_budget=None, cache_name=None):
+        from llm_provider import AnthropicProvider
+        provider = AnthropicProvider.__new__(AnthropicProvider)
+        provider._thinking_warned = False
+        captured = {}
+        fake_response = SimpleNamespace(
+            content=[SimpleNamespace(type="tool_use", input={"verdict": "OK", "summary": ""})],
+            usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+        )
+
+        def fake_create(**kwargs):
+            captured.update(kwargs)
+            return fake_response
+
+        provider.client = SimpleNamespace(
+            messages=SimpleNamespace(create=fake_create)
+        )
+        provider._generate_once(
+            model,
+            [ContentPart(type="text", data="hi")],
+            MockReview,
+            thinking_budget=thinking_budget,
+            cache_name=cache_name,
+        )
+        return captured
+
+    def test_tools_array_has_correct_shape(self):
+        try:
+            captured = self._run()
+            tools = captured["tools"]
+            assert len(tools) == 1
+            tool = tools[0]
+            assert set(tool.keys()) == {"name", "description", "input_schema"}
+            assert tool["name"] == "submit_review"
+            assert tool["input_schema"] == MockReview.model_json_schema()
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_max_tokens_set(self):
+        try:
+            captured = self._run()
+            assert captured["max_tokens"] == 16384
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_nudge_appended_under_adaptive_thinking(self):
+        try:
+            captured = self._run(model="claude-opus-4-7", thinking_budget=10240)
+            content = captured["messages"][0]["content"]
+            tail = content[-1]
+            assert tail["type"] == "text"
+            assert "submit_review" in tail["text"]
+            assert "exactly once" in tail["text"]
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_no_nudge_when_thinking_off(self):
+        try:
+            captured = self._run(model="claude-opus-4-7", thinking_budget=0)
+            content = captured["messages"][0]["content"]
+            assert all("submit_review" not in b.get("text", "") for b in content)
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+
+class TestAnthropicTokenUsage:
+    def _run_with_response(self, response):
+        from llm_provider import AnthropicProvider
+        provider = AnthropicProvider.__new__(AnthropicProvider)
+        provider._thinking_warned = False
+        provider.client = SimpleNamespace(
+            messages=SimpleNamespace(create=lambda **k: response)
+        )
+        return provider._generate_once(
+            "claude-opus-4-7",
+            [ContentPart(type="text", data="hi")],
+            MockReview,
+        )
+
+    def test_populated_from_usage(self):
+        try:
+            response = SimpleNamespace(
+                content=[SimpleNamespace(type="tool_use", input={"verdict": "OK", "summary": ""})],
+                usage=SimpleNamespace(input_tokens=100, output_tokens=50),
+            )
+            _, tok = self._run_with_response(response)
+            assert tok.input_tokens == 100
+            assert tok.output_tokens == 50
+            assert tok.thinking_tokens == 0  # Anthropic does not expose thinking tokens
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+    def test_missing_tool_block_raises(self):
+        try:
+            response = SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="no tool call here")],
+                usage=SimpleNamespace(input_tokens=1, output_tokens=1),
+            )
+            with pytest.raises(ValueError, match="tool_use"):
+                self._run_with_response(response)
+        except ImportError:
+            pytest.skip("anthropic SDK not installed")
+
+
+class TestOpenAIRequestKwargs:
+    def _run(self, model, thinking_budget=None, contents=None):
+        from llm_provider import OpenAIProvider
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider._thinking_warned = False
+        captured = {}
+        fake_response = SimpleNamespace(
+            output_parsed=MockReview(verdict="OK", summary=""),
+            usage=SimpleNamespace(
+                input_tokens=10,
+                output_tokens=5,
+                output_tokens_details=SimpleNamespace(reasoning_tokens=3),
+            ),
+        )
+
+        def fake_parse(**kwargs):
+            captured.update(kwargs)
+            return fake_response
+
+        provider.client = SimpleNamespace(
+            responses=SimpleNamespace(parse=fake_parse)
+        )
+        provider._generate_once(
+            model,
+            contents or [ContentPart(type="text", data="hi")],
+            MockReview,
+            thinking_budget=thinking_budget,
+        )
+        return captured
+
+    def test_text_format_always_set(self):
+        try:
+            captured = self._run("gpt-4o")
+            assert captured["text_format"] is MockReview
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_input_is_list_of_role_blocks(self):
+        try:
+            captured = self._run("gpt-4o")
+            inp = captured["input"]
+            assert isinstance(inp, list)
+            assert inp[0]["role"] == "user"
+            assert isinstance(inp[0]["content"], list)
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_reasoning_passed_for_reasoning_models(self):
+        try:
+            captured = self._run("gpt-5", thinking_budget=10240)
+            assert captured["reasoning"] == {"effort": "high"}
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_reasoning_effort_low_for_small_budget(self):
+        try:
+            captured = self._run("o3-mini", thinking_budget=1024)
+            assert captured["reasoning"] == {"effort": "low"}
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_no_reasoning_for_non_reasoning_models(self):
+        try:
+            captured = self._run("gpt-4o", thinking_budget=10240)
+            assert "reasoning" not in captured
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_no_reasoning_when_budget_zero(self):
+        try:
+            captured = self._run("gpt-5", thinking_budget=0)
+            assert "reasoning" not in captured
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+
+class TestOpenAITokenUsage:
+    def _run_with_response(self, response):
+        from llm_provider import OpenAIProvider
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider._thinking_warned = False
+        provider.client = SimpleNamespace(
+            responses=SimpleNamespace(parse=lambda **k: response)
+        )
+        return provider._generate_once(
+            "gpt-5",
+            [ContentPart(type="text", data="hi")],
+            MockReview,
+        )
+
+    def test_populated_with_reasoning_tokens(self):
+        try:
+            response = SimpleNamespace(
+                output_parsed=MockReview(verdict="OK"),
+                usage=SimpleNamespace(
+                    input_tokens=100,
+                    output_tokens=50,
+                    output_tokens_details=SimpleNamespace(reasoning_tokens=25),
+                ),
+            )
+            _, tok = self._run_with_response(response)
+            assert tok.input_tokens == 100
+            assert tok.output_tokens == 50
+            assert tok.thinking_tokens == 25
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_no_reasoning_tokens_when_details_missing(self):
+        try:
+            response = SimpleNamespace(
+                output_parsed=MockReview(verdict="OK"),
+                usage=SimpleNamespace(
+                    input_tokens=100,
+                    output_tokens=50,
+                    output_tokens_details=None,
+                ),
+            )
+            _, tok = self._run_with_response(response)
+            assert tok.input_tokens == 100
+            assert tok.output_tokens == 50
+            assert tok.thinking_tokens == 0
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_missing_parsed_raises(self):
+        try:
+            response = SimpleNamespace(output_parsed=None, usage=None)
+            with pytest.raises(ValueError, match="parsed"):
+                self._run_with_response(response)
         except ImportError:
             pytest.skip("openai SDK not installed")
 
