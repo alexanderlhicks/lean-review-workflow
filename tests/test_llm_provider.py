@@ -17,6 +17,11 @@ from llm_provider import (
     extract_pdf_text, _api_semaphore,
 )
 
+ANTHROPIC_MODEL = "claude-opus-4-7"
+GEMINI_PRO_MODEL = "gemini-3.1-pro-preview"
+GEMINI_FLASH_MODEL = "gemini-3-flash-preview"
+OPENAI_MODEL = "gpt-5.4"
+
 
 # --- Test schema for structured output ---
 class MockReview(BaseModel):
@@ -376,23 +381,20 @@ class TestGeminiThinking:
     def test_thinking_model_detection(self):
         try:
             p = self._provider()
-            assert p._is_thinking_model("gemini-3-pro")
-            assert p._is_thinking_model("gemini-3-flash")
-            assert p._is_thinking_model("gemini-3.1-pro")
+            assert p._is_thinking_model(GEMINI_PRO_MODEL)
+            assert p._is_thinking_model("gemini-3-pro-preview")
+            assert p._is_thinking_model(GEMINI_FLASH_MODEL)
             assert not p._is_thinking_model("gemini-2.5-pro")
             assert not p._is_thinking_model("gemini-1.5-flash")
         except ImportError:
             pytest.skip("google-genai SDK not installed")
 
-    def test_level_for_budget(self):
+    def test_default_thinking_level(self):
         try:
             from llm_provider import GeminiProvider
-            assert GeminiProvider._level_for_budget(1) == "low"
-            assert GeminiProvider._level_for_budget(2048) == "low"
-            assert GeminiProvider._level_for_budget(2049) == "medium"
-            assert GeminiProvider._level_for_budget(8192) == "medium"
-            assert GeminiProvider._level_for_budget(8193) == "high"
-            assert GeminiProvider._level_for_budget(10240) == "high"
+            assert GeminiProvider._default_thinking_level(GEMINI_PRO_MODEL) == "high"
+            assert GeminiProvider._default_thinking_level("gemini-3-pro-preview") == "high"
+            assert GeminiProvider._default_thinking_level(GEMINI_FLASH_MODEL) == "high"
         except ImportError:
             pytest.skip("google-genai SDK not installed")
 
@@ -417,7 +419,7 @@ class TestGeminiThinking:
             )
             provider.client = fake_client
             result, _ = provider._generate_once(
-                "gemini-3-flash",
+                GEMINI_FLASH_MODEL,
                 [ContentPart(type="text", data="hi")],
                 MockReview,
             )
@@ -443,7 +445,7 @@ class TestGeminiThinking:
             provider.client = fake_client
             with pytest.raises(ValueError):
                 provider._generate_once(
-                    "gemini-3-flash",
+                    GEMINI_FLASH_MODEL,
                     [ContentPart(type="text", data="hi")],
                     MockReview,
                 )
@@ -547,7 +549,7 @@ class TestAnthropicThinking:
     def test_adaptive_model_detection(self):
         try:
             p = self._provider()
-            assert p._is_adaptive_thinking_model("claude-opus-4-7")
+            assert p._is_adaptive_thinking_model(ANTHROPIC_MODEL)
             assert p._is_adaptive_thinking_model("claude-opus-4-6")
             assert p._is_adaptive_thinking_model("claude-sonnet-4-6")
             assert p._is_adaptive_thinking_model("claude-mythos-preview")
@@ -596,7 +598,7 @@ class TestAnthropicThinking:
 
     def test_adaptive_request_uses_output_config(self):
         try:
-            captured = self._run_with_fake_client("claude-opus-4-7", 10240)
+            captured = self._run_with_fake_client(ANTHROPIC_MODEL, 10240)
             assert captured["thinking"] == {"type": "adaptive"}
             assert captured["output_config"] == {"effort": "high"}
             assert captured["tool_choice"] == {"type": "auto"}
@@ -686,8 +688,8 @@ class TestOpenAIReasoning:
     def test_reasoning_model_detection(self):
         try:
             p = self._provider()
-            assert p._is_reasoning_model("gpt-5")
-            assert p._is_reasoning_model("gpt-5-mini")
+            assert p._is_reasoning_model(OPENAI_MODEL)
+            assert p._is_reasoning_model("gpt-5.4-mini")
             assert p._is_reasoning_model("o1-preview")
             assert p._is_reasoning_model("o3-mini")
             assert p._is_reasoning_model("o4-mini")
@@ -751,7 +753,7 @@ class TestGeminiRequestKwargs:
 
     def test_response_schema_always_set(self):
         try:
-            captured = self._run("gemini-3-pro")
+            captured = self._run(GEMINI_PRO_MODEL)
             config = captured["config"]
             assert config.response_mime_type == "application/json"
             assert config.response_schema is MockReview
@@ -766,9 +768,25 @@ class TestGeminiRequestKwargs:
 
     def test_gemini_3_uses_thinking_level(self):
         try:
-            captured = self._run("gemini-3-pro", thinking_budget=10240)
+            captured = self._run(GEMINI_PRO_MODEL, thinking_budget=10240)
             config = captured["config"]
             assert config.thinking_config is not None
+            assert self._level_str(config.thinking_config.thinking_level) == "high"
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_gemini_3_1_pro_defaults_to_high(self):
+        try:
+            captured = self._run(GEMINI_PRO_MODEL, thinking_budget=1024)
+            config = captured["config"]
+            assert self._level_str(config.thinking_config.thinking_level) == "high"
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_gemini_3_flash_defaults_to_high_even_with_low_budget(self):
+        try:
+            captured = self._run(GEMINI_FLASH_MODEL, thinking_budget=1024)
+            config = captured["config"]
             assert self._level_str(config.thinking_config.thinking_level) == "high"
         except ImportError:
             pytest.skip("google-genai SDK not installed")
@@ -781,17 +799,17 @@ class TestGeminiRequestKwargs:
         except ImportError:
             pytest.skip("google-genai SDK not installed")
 
-    def test_no_thinking_config_when_budget_zero(self):
+    def test_gemini_3_sets_high_thinking_even_when_budget_zero(self):
         try:
-            captured = self._run("gemini-3-pro", thinking_budget=0)
+            captured = self._run(GEMINI_PRO_MODEL, thinking_budget=0)
             config = captured["config"]
-            assert config.thinking_config is None
+            assert self._level_str(config.thinking_config.thinking_level) == "high"
         except ImportError:
             pytest.skip("google-genai SDK not installed")
 
     def test_cached_content_passed_to_config(self):
         try:
-            captured = self._run("gemini-3-pro", cache_name="cachedContents/abc")
+            captured = self._run(GEMINI_PRO_MODEL, cache_name="cachedContents/abc")
             config = captured["config"]
             assert config.cached_content == "cachedContents/abc"
         except ImportError:
@@ -809,7 +827,7 @@ class TestGeminiTokenUsage:
             models=SimpleNamespace(generate_content=lambda **k: response)
         )
         _, tok = provider._generate_once(
-            "gemini-3-pro",
+            GEMINI_PRO_MODEL,
             [ContentPart(type="text", data="hi")],
             MockReview,
         )
@@ -849,7 +867,7 @@ class TestGeminiTokenUsage:
 
 
 class TestAnthropicRequestShape:
-    def _run(self, model="claude-opus-4-7", thinking_budget=None, cache_name=None):
+    def _run(self, model=ANTHROPIC_MODEL, thinking_budget=None, cache_name=None):
         from llm_provider import AnthropicProvider
         provider = AnthropicProvider.__new__(AnthropicProvider)
         provider._thinking_warned = False
@@ -896,7 +914,7 @@ class TestAnthropicRequestShape:
 
     def test_nudge_appended_under_adaptive_thinking(self):
         try:
-            captured = self._run(model="claude-opus-4-7", thinking_budget=10240)
+            captured = self._run(model=ANTHROPIC_MODEL, thinking_budget=10240)
             content = captured["messages"][0]["content"]
             tail = content[-1]
             assert tail["type"] == "text"
@@ -907,7 +925,7 @@ class TestAnthropicRequestShape:
 
     def test_no_nudge_when_thinking_off(self):
         try:
-            captured = self._run(model="claude-opus-4-7", thinking_budget=0)
+            captured = self._run(model=ANTHROPIC_MODEL, thinking_budget=0)
             content = captured["messages"][0]["content"]
             assert all("submit_review" not in b.get("text", "") for b in content)
         except ImportError:
@@ -923,7 +941,7 @@ class TestAnthropicTokenUsage:
             messages=SimpleNamespace(create=lambda **k: response)
         )
         return provider._generate_once(
-            "claude-opus-4-7",
+            ANTHROPIC_MODEL,
             [ContentPart(type="text", data="hi")],
             MockReview,
         )
@@ -1002,7 +1020,7 @@ class TestOpenAIRequestKwargs:
 
     def test_reasoning_passed_for_reasoning_models(self):
         try:
-            captured = self._run("gpt-5", thinking_budget=10240)
+            captured = self._run(OPENAI_MODEL, thinking_budget=10240)
             assert captured["reasoning"] == {"effort": "high"}
         except ImportError:
             pytest.skip("openai SDK not installed")
@@ -1023,7 +1041,7 @@ class TestOpenAIRequestKwargs:
 
     def test_no_reasoning_when_budget_zero(self):
         try:
-            captured = self._run("gpt-5", thinking_budget=0)
+            captured = self._run(OPENAI_MODEL, thinking_budget=0)
             assert "reasoning" not in captured
         except ImportError:
             pytest.skip("openai SDK not installed")
@@ -1038,7 +1056,7 @@ class TestOpenAITokenUsage:
             responses=SimpleNamespace(parse=lambda **k: response)
         )
         return provider._generate_once(
-            "gpt-5",
+            OPENAI_MODEL,
             [ContentPart(type="text", data="hi")],
             MockReview,
         )

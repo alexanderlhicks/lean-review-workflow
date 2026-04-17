@@ -137,9 +137,11 @@ class LLMProvider(ABC):
 class GeminiProvider(LLMProvider):
     """Google Gemini API provider.
 
-    Scoped to the Gemini 3 family (e.g. `gemini-3-pro`, `gemini-3-flash`), which
-    uses `ThinkingConfig(thinking_level=...)` with enum effort levels rather
-    than the Gemini 2.5-style integer `thinking_budget`.
+    Scoped to the Gemini 3 family (e.g. `gemini-3.1-pro-preview`,
+    `gemini-3-flash-preview`), which uses
+    `ThinkingConfig(thinking_level=...)` rather than the Gemini 2.5-style
+    integer `thinking_budget`. For the supported Gemini 3 review models, we
+    explicitly request `high` thinking by default.
     """
 
     # Model-name prefixes that accept ThinkingConfig(thinking_level=...).
@@ -175,12 +177,8 @@ class GeminiProvider(LLMProvider):
         return model.startswith(self._THINKING_MODEL_PREFIXES)
 
     @staticmethod
-    def _level_for_budget(thinking_budget: int) -> str:
-        """Map an Anthropic-style token budget to a Gemini 3 thinking_level."""
-        if thinking_budget <= 2048:
-            return "low"
-        if thinking_budget <= 8192:
-            return "medium"
+    def _default_thinking_level(model: str) -> str:
+        """Return the default Gemini 3 thinking level for supported review models."""
         return "high"
 
     def _generate_once(self, model, contents, schema, thinking_budget=None, cache_name=None):
@@ -190,12 +188,11 @@ class GeminiProvider(LLMProvider):
         }
         if cache_name:
             kwargs['cached_content'] = cache_name
-        if thinking_budget:
-            if self._is_thinking_model(model):
-                kwargs['thinking_config'] = self._types.ThinkingConfig(
-                    thinking_level=self._level_for_budget(thinking_budget)
-                )
-            elif not self._thinking_warned:
+        if self._is_thinking_model(model):
+            kwargs['thinking_config'] = self._types.ThinkingConfig(
+                thinking_level=self._default_thinking_level(model)
+            )
+        elif thinking_budget and not self._thinking_warned:
                 logging.warning(
                     f"Model '{model}' is outside the supported Gemini 3 family; "
                     f"thinking_budget will be ignored."
