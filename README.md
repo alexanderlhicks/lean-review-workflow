@@ -6,7 +6,7 @@ This GitHub Action provides an AI-powered code review for Pull Requests in Lean 
 
 *   **5-Agent Review Pipeline:**
     1.  **Mechanical Pre-Checks:** Deterministic scanning for escape hatches (`sorry`, `axiom`, `native_decide`, `opaque`, `implemented_by`, `sorryAx`) in both newly introduced and pre-existing code, with comment- and string-awareness (including Lean 4 nested block comments).
-    2.  **Specification Analyst (Agent A):** Reads external PDFs and math papers (native multimodal for Gemini/Anthropic; text extraction via pymupdf for OpenAI) to extract a "Formalization Checklist" — a mapping from paper results to mathematical content that any correct formalization must preserve. Receives repository structure and dependency graph for awareness of existing formalizations.
+    2.  **Specification Analyst (Agent A):** Reads external PDFs and math papers (native multimodal across Gemini, Anthropic, and OpenAI) to extract a "Formalization Checklist" — a mapping from paper results to mathematical content that any correct formalization must preserve. Receives repository structure and dependency graph for awareness of existing formalizations.
     3.  **Triage Agent:** Groups changed files into review clusters based on the dependency graph and type signatures, prioritizing tightly-coupled files for joint review. Produces a **review strategy** and **key hypotheses** per cluster that guide the per-file reviewers.
     4.  **Code Reviewer (Agent B):** Evaluates each Lean file's diff and full content against the spec checklist, repository context, and Lean 4 best practices. Writes a structured **analysis** before producing findings (what the code does mathematically, risk assessment, spec mapping). Runs in parallel across files (up to 5 concurrent workers) with cluster-level type signatures, review strategy, and key hypotheses.
     5.  **Cross-File Analysis Agent:** Analyzes composition chains, type-flow across files, axiom/escape-hatch impact propagation, and external dependency correctness.
@@ -213,7 +213,7 @@ jobs:
 | `additional_comments` | No | `""` | Extra focus instructions for the AI reviewer |
 | `lint` | No | `false` | Whether to run the Lean linter |
 | `dependency_depth` | No | `2` | Depth of transitive dependency traversal (1=direct only, 2=imports of imports) |
-| `thinking_budget` | No | `10240` | Thinking token budget for deep-analysis agents. On OpenAI, mapped to `reasoning.effort` (low/medium/high) and only applied to reasoning-capable models (o1/o3/o4/gpt-5). |
+| `thinking_budget` | No | `10240` | Thinking token budget for deep-analysis agents. Passed directly to Anthropic. On OpenAI, mapped to `reasoning.effort` (low/medium/high) for reasoning-capable models (o1/o3/o4/gpt-5). On Gemini 3, mapped to `ThinkingConfig.thinking_level` (low/medium/high). |
 | `spec_model` | No | `model` | Model override for the Specification Analyst agent |
 | `triage_model` | No | `model` | Model override for the Triage agent |
 | `review_model` | No | `model` | Model override for the per-file Code Reviewer agent |
@@ -226,7 +226,7 @@ jobs:
 |---------|--------|-------------------|--------------|
 | Structured output | Native schema | Tool use pattern | Native schema (Responses API `text_format`) |
 | Native PDF | Yes | Yes (document blocks) | Yes (`input_file` via Responses API) |
-| Extended thinking | ThinkingConfig | Thinking blocks | `reasoning.effort` on reasoning models (o1/o3/o4/gpt-5); ignored with warning on non-reasoning models |
+| Extended thinking | `ThinkingConfig.thinking_level` (Gemini 3 only) | Thinking blocks | `reasoning.effort` on reasoning models (o1/o3/o4/gpt-5); ignored with warning on non-reasoning models |
 | Content caching | Server-side (TTL) | Per-request (ephemeral) | Automatic |
 
 ## Project Structure

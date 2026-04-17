@@ -135,7 +135,15 @@ class LLMProvider(ABC):
 # ---------------------------------------------------------------------------
 
 class GeminiProvider(LLMProvider):
-    """Google Gemini API provider."""
+    """Google Gemini API provider.
+
+    Scoped to the Gemini 3 family (e.g. `gemini-3-pro`, `gemini-3-flash`), which
+    uses `ThinkingConfig(thinking_level=...)` with enum effort levels rather
+    than the Gemini 2.5-style integer `thinking_budget`.
+    """
+
+    # Model-name prefixes that accept ThinkingConfig(thinking_level=...).
+    _THINKING_MODEL_PREFIXES = ("gemini-3",)
 
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
@@ -163,6 +171,18 @@ class GeminiProvider(LLMProvider):
                 logging.warning(f"Unknown ContentPart type '{part.type}' — skipping")
         return native
 
+    def _is_thinking_model(self, model: str) -> bool:
+        return model.startswith(self._THINKING_MODEL_PREFIXES)
+
+    @staticmethod
+    def _level_for_budget(thinking_budget: int) -> str:
+        """Map an Anthropic-style token budget to a Gemini 3 thinking_level."""
+        if thinking_budget <= 2048:
+            return "low"
+        if thinking_budget <= 8192:
+            return "medium"
+        return "high"
+
     def _generate_once(self, model, contents, schema, thinking_budget=None, cache_name=None):
         kwargs = {
             'response_mime_type': 'application/json',
@@ -171,7 +191,16 @@ class GeminiProvider(LLMProvider):
         if cache_name:
             kwargs['cached_content'] = cache_name
         if thinking_budget:
-            kwargs['thinking_config'] = self._types.ThinkingConfig(thinking_budget=thinking_budget)
+            if self._is_thinking_model(model):
+                kwargs['thinking_config'] = self._types.ThinkingConfig(
+                    thinking_level=self._level_for_budget(thinking_budget)
+                )
+            elif not self._thinking_warned:
+                logging.warning(
+                    f"Model '{model}' is outside the supported Gemini 3 family; "
+                    f"thinking_budget will be ignored."
+                )
+                self._thinking_warned = True
         config = self._types.GenerateContentConfig(**kwargs)
 
         native_contents = self._to_native_contents(contents)
@@ -186,7 +215,13 @@ class GeminiProvider(LLMProvider):
             usage.output_tokens = getattr(meta, 'candidates_token_count', 0) or 0
             usage.thinking_tokens = getattr(meta, 'thoughts_token_count', 0) or 0
 
-        return response.parsed, usage
+        parsed = getattr(response, 'parsed', None)
+        if parsed is None:
+            text = getattr(response, 'text', None)
+            if not text:
+                raise ValueError("Gemini response contained neither parsed output nor text")
+            parsed = schema.model_validate_json(text)
+        return parsed, usage
 
     def create_cache(self, model, contents, ttl=3600):
         try:

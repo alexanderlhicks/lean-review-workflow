@@ -328,6 +328,91 @@ class TestGeminiContentConversion:
             pytest.skip("google-genai SDK not installed")
 
 
+class TestGeminiThinking:
+    def _provider(self):
+        from llm_provider import GeminiProvider
+        provider = GeminiProvider.__new__(GeminiProvider)
+        provider._thinking_warned = False
+        return provider
+
+    def test_thinking_model_detection(self):
+        try:
+            p = self._provider()
+            assert p._is_thinking_model("gemini-3-pro")
+            assert p._is_thinking_model("gemini-3-flash")
+            assert p._is_thinking_model("gemini-3.1-pro")
+            assert not p._is_thinking_model("gemini-2.5-pro")
+            assert not p._is_thinking_model("gemini-1.5-flash")
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_level_for_budget(self):
+        try:
+            from llm_provider import GeminiProvider
+            assert GeminiProvider._level_for_budget(1) == "low"
+            assert GeminiProvider._level_for_budget(2048) == "low"
+            assert GeminiProvider._level_for_budget(2049) == "medium"
+            assert GeminiProvider._level_for_budget(8192) == "medium"
+            assert GeminiProvider._level_for_budget(8193) == "high"
+            assert GeminiProvider._level_for_budget(10240) == "high"
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_parsed_fallback_uses_text(self):
+        """If response.parsed is None, fall back to parsing response.text."""
+        try:
+            from llm_provider import GeminiProvider
+            from google.genai import types
+            provider = GeminiProvider.__new__(GeminiProvider)
+            provider._types = types
+            provider._thinking_warned = False
+
+            fake_response = SimpleNamespace(
+                parsed=None,
+                text='{"verdict":"OK","summary":"from-text"}',
+                usage_metadata=None,
+            )
+            fake_client = SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content=lambda **kwargs: fake_response
+                )
+            )
+            provider.client = fake_client
+            result, _ = provider._generate_once(
+                "gemini-3-flash",
+                [ContentPart(type="text", data="hi")],
+                MockReview,
+            )
+            assert result.verdict == "OK"
+            assert result.summary == "from-text"
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+    def test_missing_parsed_and_text_raises(self):
+        try:
+            from llm_provider import GeminiProvider
+            from google.genai import types
+            provider = GeminiProvider.__new__(GeminiProvider)
+            provider._types = types
+            provider._thinking_warned = False
+
+            fake_response = SimpleNamespace(parsed=None, text="", usage_metadata=None)
+            fake_client = SimpleNamespace(
+                models=SimpleNamespace(
+                    generate_content=lambda **kwargs: fake_response
+                )
+            )
+            provider.client = fake_client
+            with pytest.raises(ValueError):
+                provider._generate_once(
+                    "gemini-3-flash",
+                    [ContentPart(type="text", data="hi")],
+                    MockReview,
+                )
+        except ImportError:
+            pytest.skip("google-genai SDK not installed")
+
+
 class TestAnthropicContentConversion:
     def test_text_content(self):
         try:
