@@ -66,6 +66,24 @@ def get_transitive_dependencies(changed_modules, lake_graph_json, max_depth=2):
 
     return visited
 
+def partition_context_tiers(final_file_list, changed_files, dep_files_with_depth, context_limit):
+    """Split discovered files into full-context and summary-context tiers.
+
+    Changed files are ordered first (they are the review target), then other
+    files by depth-1 before depth-2+. The total full-context tier is
+    hard-capped at `context_limit`; anything past the cap — including changed
+    files on huge PRs — falls through to the summary tier (signatures only).
+
+    Returns (full_context_files, summary_context_files), both lists of paths.
+    """
+    changed_set = set(changed_files)
+    changed_first = [f for f in final_file_list if f in changed_set]
+    others = [f for f in final_file_list if f not in changed_set]
+    others.sort(key=lambda fp: (dep_files_with_depth.get(fp, 1), fp))
+    all_ordered = changed_first + others
+    return all_ordered[:context_limit], all_ordered[context_limit:]
+
+
 def build_lean_file_index():
     index = []
     for root, dirs, files in os.walk('.'):
@@ -143,15 +161,9 @@ def main():
     except ValueError:
         CONTEXT_LIMIT = 50
 
-    # Separate into full-context and summary-context tiers with depth-based priority
-    changed_first = [f for f in final_file_list if f in changed_files]
-    others = [f for f in final_file_list if f not in changed_files]
-
-    # Sort others: depth-1 (direct dependents + direct deps) before depth-2+ (transitive)
-    others.sort(key=lambda fp: (dep_files_with_depth.get(fp, 1), fp))
-
-    full_context_files = changed_first + others[:max(0, CONTEXT_LIMIT - len(changed_first))]
-    summary_context_files = others[max(0, CONTEXT_LIMIT - len(changed_first)):]
+    full_context_files, summary_context_files = partition_context_tiers(
+        final_file_list, set(changed_files), dep_files_with_depth, CONTEXT_LIMIT,
+    )
 
     if summary_context_files:
         print(f"::notice::Discovered {len(final_file_list)} files. {len(full_context_files)} with full context, {len(summary_context_files)} with summary context (type signatures only).")

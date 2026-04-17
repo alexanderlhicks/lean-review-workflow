@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, List, Literal, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -130,6 +130,18 @@ MAX_GITHUB_COMMENT_SIZE = 65000
 HTTP_TIMEOUT = 30
 MAX_HTTP_REDIRECTS = 5
 
+# Conservative character budget for assembled prompts. At ~3 chars/token for
+# code-heavy text this is roughly 830K tokens, leaving headroom under the 1M
+# context limit for output + thinking. Overridable via MAX_PROMPT_CHARS.
+try:
+    MAX_PROMPT_CHARS = int(os.environ.get("MAX_PROMPT_CHARS", "2500000"))
+except ValueError:
+    MAX_PROMPT_CHARS = 2_500_000
+
+# Replacement keys that are safe to truncate when a prompt exceeds the budget,
+# in order of preference (bulkiest / least-essential first).
+_TRIMMABLE_KEYS = ("REPO_CONTEXT", "DEPENDENCY_CONTEXT")
+
 # --- Helper Functions ---
 def _load_prompt(template_name: str, replacements: Dict[str, str]) -> str:
     """Loads a prompt template and applies replacements with validation."""
@@ -149,6 +161,81 @@ def _load_prompt(template_name: str, replacements: Dict[str, str]) -> str:
         logging.warning(f"Unreplaced placeholders in {template_name}: {remaining}")
 
     return result
+
+
+def _render(template: str, replacements: Dict[str, str]) -> str:
+    """Apply {{KEY}} substitutions to a template string."""
+    result = template
+    for key, value in replacements.items():
+        result = result.replace("{{" + key + "}}", value)
+    return result
+
+
+def _fit_replacements_to_budget(
+    template: str,
+    replacements: Dict[str, str],
+    max_chars: int,
+    context_label: str = "",
+) -> Dict[str, str]:
+    """Trim keys in _TRIMMABLE_KEYS (REPO_CONTEXT, DEPENDENCY_CONTEXT) so that
+    `_render(template, result)` is at most `max_chars` characters.
+
+    Pure string logic — does not touch disk. Keeps FILE_DIFF, FULL_CONTENT,
+    and the spec checklist intact; those are the core of the review.
+    """
+    rendered = _render(template, replacements)
+    if len(rendered) <= max_chars:
+        return replacements
+
+    result = dict(replacements)
+    tag = f" ({context_label})" if context_label else ""
+
+    for key in _TRIMMABLE_KEYS:
+        current = result.get(key, "")
+        if not current:
+            continue
+        rendered = _render(template, result)
+        if len(rendered) <= max_chars:
+            return result
+        overshoot = len(rendered) - max_chars
+        marker = f"\n\n[... {key} truncated to fit context window budget ...]\n"
+        if len(current) > overshoot + len(marker):
+            keep = len(current) - overshoot - len(marker)
+            result[key] = current[:keep] + marker
+            logging.warning(
+                f"Prompt{tag} exceeded budget by {overshoot:,} chars; "
+                f"truncated {key} to {keep:,} chars."
+            )
+        else:
+            result[key] = f"[{key} omitted: exceeded context window budget]"
+            logging.warning(
+                f"Prompt{tag} still over budget after considering {key}; "
+                f"dropped {key} entirely."
+            )
+
+    rendered = _render(template, result)
+    if len(rendered) > max_chars:
+        logging.warning(
+            f"Prompt{tag} remains {len(rendered):,} chars (> {max_chars:,}) after "
+            f"trimming {list(_TRIMMABLE_KEYS)}. The API may still reject it."
+        )
+    return result
+
+
+def _fit_prompt_to_budget(
+    template_name: str,
+    replacements: Dict[str, str],
+    max_chars: int = MAX_PROMPT_CHARS,
+    context_label: str = "",
+) -> Dict[str, str]:
+    """Disk-backed wrapper around `_fit_replacements_to_budget`.
+
+    Reads the named prompt template and returns a trimmed replacements dict.
+    """
+    path = os.path.join(ACTION_PATH, "prompts", template_name)
+    with open(path, "r") as f:
+        template = f.read()
+    return _fit_replacements_to_budget(template, replacements, max_chars, context_label)
 
 
 def _check_ip_safe(ip_str: str) -> Tuple[bool, str]:
@@ -581,15 +668,15 @@ def get_pr_diff(pr_number: str) -> Tuple[str, List[str]]:
         return "", errors
 
 
-def get_repo_files_content(paths_str: str) -> Tuple[str, List[str]]:
-    """Reads content from a comma-separated string of file and directory paths."""
+def get_repo_files_by_path(paths_str: str) -> Tuple[Dict[str, str], List[str]]:
+    """Read content from a comma-separated string of file/directory paths,
+    keyed by path. Returns (path_to_content, errors)."""
     if not paths_str:
-        logging.info("No repository context files were provided.")
-        return "No repository context files were provided.", []
-    all_files_content, errors = "", []
-    paths = [path.strip() for path in paths_str.split(',') if path.strip()]
+        return {}, []
+    errors: List[str] = []
+    paths = [p.strip() for p in paths_str.split(',') if p.strip()]
     logging.info(f"Fetching content from {len(paths)} repository paths...")
-    expanded_files = []
+    expanded_files: List[str] = []
     for path in paths:
         if os.path.isdir(path):
             for root, _, files in os.walk(path):
@@ -598,13 +685,38 @@ def get_repo_files_content(paths_str: str) -> Tuple[str, List[str]]:
             expanded_files.append(path)
         else:
             errors.append(f"Could not find file or directory: {path}")
-    for file_path in sorted(list(set(expanded_files))):
+    result: Dict[str, str] = {}
+    for file_path in sorted(set(expanded_files)):
         content = file_cache.read(file_path)
-        if content is not None:
-            all_files_content += f"--- Start of content from {file_path} ---\n{content}\n--- End of content from {file_path} ---\n\n"
-        else:
+        if content is None:
             errors.append(f"Error reading file {file_path}")
-    return all_files_content, errors
+            continue
+        result[file_path] = content
+    return result, errors
+
+
+def _format_repo_files(files_by_path: Dict[str, str], exclude: Optional[set] = None) -> str:
+    """Render a path→content dict as the REPO_CONTEXT block format.
+    `exclude`: optional set of paths to omit (e.g. files being reviewed
+    separately)."""
+    exclude = exclude or set()
+    emitted = [
+        f"--- Start of content from {path} ---\n{content}\n--- End of content from {path} ---\n\n"
+        for path, content in files_by_path.items() if path not in exclude
+    ]
+    if not emitted:
+        return "No repository context files were provided." if not files_by_path \
+            else "No repository context files remain after excluding files under review."
+    return "".join(emitted)
+
+
+def get_repo_files_content(paths_str: str) -> Tuple[str, List[str]]:
+    """Legacy wrapper: returns the concatenated REPO_CONTEXT string."""
+    if not paths_str:
+        logging.info("No repository context files were provided.")
+        return "No repository context files were provided.", []
+    files_by_path, errors = get_repo_files_by_path(paths_str)
+    return _format_repo_files(files_by_path), errors
 
 def split_diff_into_files(diff_content: str) -> Dict[str, str]:
     """Splits a full git diff into a dictionary of per-file diffs.
@@ -695,18 +807,32 @@ def analyze_file_changes_with_context(provider: LLMProvider, review_context: dic
     if cluster_context:
         cluster_section = f"**Review Cluster Context (signatures of related files in this cluster):**\n---\n{cluster_context}\n---\n"
 
+    # Per-file REPO_CONTEXT: drop changed files (they are each reviewed on their
+    # own per-file pass, and sibling awareness is carried by cluster_context).
+    # Falls back to the pre-rendered string if the structured inputs are absent
+    # (e.g. callers that don't populate repo_files_by_path).
+    repo_files_by_path = review_context.get("repo_files_by_path")
+    if repo_files_by_path is not None:
+        exclude = set(review_context.get("changed_files", set()))
+        per_file_repo = _format_repo_files(repo_files_by_path, exclude=exclude)
+        per_file_repo += review_context.get("repo_context_appendix", "")
+    else:
+        per_file_repo = review_context.get("repo_context", "")
+
+    replacements = {
+        "SPEC_CHECKLIST": spec_checklist,
+        "REPO_CONTEXT": per_file_repo,
+        "FILE_PATH": file_path,
+        "FILE_DIFF": file_diff,
+        "FULL_CONTENT": full_content,
+        "ADDITIONAL_COMMENTS": additional_comments_section,
+        "CLUSTER_CONTEXT": cluster_section,
+        "LEAN4_CHECKLIST": lean4_checklist,
+        "VERDICT_RULES": verdict_rules,
+    }
     try:
-        prompt_text = _load_prompt(prompt_file, {
-            "SPEC_CHECKLIST": spec_checklist,
-            "REPO_CONTEXT": review_context.get("repo_context", ""),
-            "FILE_PATH": file_path,
-            "FILE_DIFF": file_diff,
-            "FULL_CONTENT": full_content,
-            "ADDITIONAL_COMMENTS": additional_comments_section,
-            "CLUSTER_CONTEXT": cluster_section,
-            "LEAN4_CHECKLIST": lean4_checklist,
-            "VERDICT_RULES": verdict_rules,
-        })
+        replacements = _fit_prompt_to_budget(prompt_file, replacements, context_label=file_path)
+        prompt_text = _load_prompt(prompt_file, replacements)
     except FileNotFoundError:
         return None, f"Error: Prompt template not found: {prompt_file}"
 
@@ -770,15 +896,19 @@ def analyze_cross_file(provider: LLMProvider, diff_by_file: Dict[str, str], spec
     if additional_comments and additional_comments.strip():
         additional_comments_section = f"**Additional Reviewer Comments:**\n---\n{additional_comments}\n---\n"
 
+    replacements = {
+        "SPEC_CHECKLIST": spec_checklist or "No specification checklist provided.",
+        "PRE_CHECK_FINDINGS": pre_check_findings,
+        "ALL_DIFFS": all_diffs,
+        "ALL_CHANGED_CONTENTS": all_changed_contents,
+        "DEPENDENCY_CONTEXT": repo_context,
+        "ADDITIONAL_COMMENTS": additional_comments_section,
+    }
     try:
-        prompt_text = _load_prompt("cross_file_analysis.md", {
-            "SPEC_CHECKLIST": spec_checklist or "No specification checklist provided.",
-            "PRE_CHECK_FINDINGS": pre_check_findings,
-            "ALL_DIFFS": all_diffs,
-            "ALL_CHANGED_CONTENTS": all_changed_contents,
-            "DEPENDENCY_CONTEXT": repo_context,
-            "ADDITIONAL_COMMENTS": additional_comments_section,
-        })
+        replacements = _fit_prompt_to_budget(
+            "cross_file_analysis.md", replacements, context_label="cross-file"
+        )
+        prompt_text = _load_prompt("cross_file_analysis.md", replacements)
     except FileNotFoundError:
         logging.warning("cross_file_analysis.md not found, skipping cross-file analysis.")
         return None, ""
@@ -1017,17 +1147,19 @@ def main():
     context_warnings = []
 
     external_parts, external_errors = get_document_content(args.external_refs)
-    repo_context, repo_errors = get_repo_files_content(args.repo_context_refs)
+    repo_files_by_path, repo_errors = get_repo_files_by_path(args.repo_context_refs)
     summary_context = get_summary_context(os.environ.get("SUMMARY_FILES", ""))
 
-    # Append summary-level context (type signatures only) for overflow files
+    # Appendix: non-file content (summary signatures, Lean toolchain info).
+    # Kept separate from the file-content body so per-file reviewers can filter
+    # the body without losing the appendix.
+    repo_context_appendix = ""
     if summary_context:
-        repo_context += f"\n\n--- Summary Context (type signatures only, from overflow files) ---\n{summary_context}\n"
+        repo_context_appendix += f"\n\n--- Summary Context (type signatures only, from overflow files) ---\n{summary_context}\n"
 
-    # Append Lean toolchain info (axiom dependencies, sorry locations, diagnostics, etc.)
     lean_info = os.environ.get("LEAN_INFO", "")
     if lean_info:
-        repo_context += f"\n\n{lean_info}\n"
+        repo_context_appendix += f"\n\n{lean_info}\n"
     elif os.environ.get("DISCOVERED_FILES", ""):
         context_warnings.append(
             "Lean toolchain analysis produced no output despite changed Lean files being present. "
@@ -1037,7 +1169,10 @@ def main():
     # Append build output (warnings/errors captured from lake build)
     build_output = os.environ.get("BUILD_OUTPUT", "")
     if build_output and build_output.strip() and "no warnings" not in build_output.lower():
-        repo_context += f"\n\n**Lake Build Diagnostics (compiler output):**\n{build_output}\n"
+        repo_context_appendix += f"\n\n**Lake Build Diagnostics (compiler output):**\n{build_output}\n"
+
+    # Full repo_context used by cross-file analysis (no per-file filtering).
+    repo_context = _format_repo_files(repo_files_by_path) + repo_context_appendix
 
     all_errors = external_errors + repo_errors
     if all_errors:
@@ -1080,6 +1215,9 @@ def main():
         review_context = {
             "external_context": "[Multimodal Content Provided]",
             "repo_context": repo_context,
+            "repo_files_by_path": repo_files_by_path,
+            "repo_context_appendix": repo_context_appendix,
+            "changed_files": set(diff_by_file.keys()),
             "additional_comments": args.additional_comments,
             "review_model": args.review_model,
         }

@@ -16,6 +16,8 @@ from review import (
     run_mechanical_prechecks,
     _get_diff_lines,
     _load_prompt,
+    _fit_replacements_to_budget,
+    _format_repo_files,
     _validate_url,
     _check_ip_safe,
     _resolve_and_validate,
@@ -416,6 +418,131 @@ class TestRetryLogic:
     def test_invalid_request_not_retryable(self):
         error = Exception("400 Invalid request")
         assert _is_retryable_generic(error) is False
+
+
+# --- REPO_CONTEXT rendering and exclusion ---
+
+class TestFormatRepoFiles:
+    def test_empty_dict_returns_placeholder(self):
+        out = _format_repo_files({})
+        assert "No repository context files" in out
+
+    def test_renders_all_files_without_exclude(self):
+        files = {"A.lean": "aaa", "B.lean": "bbb"}
+        out = _format_repo_files(files)
+        assert "content from A.lean" in out
+        assert "content from B.lean" in out
+        assert "aaa" in out and "bbb" in out
+
+    def test_excludes_named_files(self):
+        files = {"A.lean": "aaa", "B.lean": "bbb", "C.lean": "ccc"}
+        out = _format_repo_files(files, exclude={"A.lean", "C.lean"})
+        assert "B.lean" in out
+        assert "A.lean" not in out
+        assert "C.lean" not in out
+        assert "bbb" in out
+        assert "aaa" not in out
+
+    def test_exclude_everything_returns_placeholder(self):
+        files = {"A.lean": "aaa"}
+        out = _format_repo_files(files, exclude={"A.lean"})
+        # Sentinel so the model knows context is intentionally empty, not missing.
+        assert "No repository context files" in out or "after excluding" in out
+
+    def test_changed_files_siblings_excluded(self):
+        """The core Change-1 invariant: when reviewing one changed file, the
+        other changed files are not duplicated into REPO_CONTEXT (they are
+        reviewed on their own per-file pass)."""
+        files = {f"Compose/F{i}.lean": f"body-{i}" for i in range(5)}
+        changed = set(files.keys())
+        target = "Compose/F2.lean"
+        out = _format_repo_files(files, exclude=changed)
+        for path in files:
+            assert path not in out
+        # Size of rendered context collapses to the placeholder when all
+        # discovered files are also changed.
+        assert len(out) < 200
+
+
+# --- Prompt-size budget ---
+
+class TestFitPromptToBudget:
+    TEMPLATE = (
+        "HEADER\n"
+        "File: {{FILE_PATH}}\n"
+        "Diff:\n{{FILE_DIFF}}\n"
+        "Content:\n{{FULL_CONTENT}}\n"
+        "Repo:\n{{REPO_CONTEXT}}\n"
+        "FOOTER\n"
+    )
+
+    def _base(self, repo_chars=0, content_chars=100):
+        return {
+            "FILE_PATH": "Foo.lean",
+            "FILE_DIFF": "a" * 50,
+            "FULL_CONTENT": "f" * content_chars,
+            "REPO_CONTEXT": "r" * repo_chars,
+        }
+
+    def test_returns_unchanged_when_under_budget(self):
+        reps = self._base(repo_chars=100)
+        out = _fit_replacements_to_budget(self.TEMPLATE, reps, max_chars=10_000)
+        assert out == reps  # identical dict
+
+    def test_truncates_repo_context_when_over_budget(self):
+        reps = self._base(repo_chars=5_000)
+        out = _fit_replacements_to_budget(self.TEMPLATE, reps, max_chars=3_000)
+        # REPO_CONTEXT is trimmed; other fields untouched.
+        assert len(out["REPO_CONTEXT"]) < 5_000
+        assert "truncated to fit context window" in out["REPO_CONTEXT"]
+        assert out["FILE_DIFF"] == reps["FILE_DIFF"]
+        assert out["FULL_CONTENT"] == reps["FULL_CONTENT"]
+        # Rendered result must fit.
+        rendered = self.TEMPLATE
+        for k, v in out.items():
+            rendered = rendered.replace("{{" + k + "}}", v)
+        assert len(rendered) <= 3_000
+
+    def test_drops_repo_context_entirely_when_still_over(self):
+        # FULL_CONTENT alone exceeds the budget — REPO_CONTEXT can't save it,
+        # but we still mark REPO_CONTEXT omitted and warn.
+        reps = self._base(repo_chars=2_000, content_chars=5_000)
+        out = _fit_replacements_to_budget(self.TEMPLATE, reps, max_chars=1_000)
+        assert "omitted" in out["REPO_CONTEXT"]
+        # FULL_CONTENT is preserved; we don't trim the file under review.
+        assert out["FULL_CONTENT"] == reps["FULL_CONTENT"]
+
+    def test_handles_missing_trimmable_key(self):
+        reps = {
+            "FILE_PATH": "Foo.lean",
+            "FILE_DIFF": "a" * 50,
+            "FULL_CONTENT": "f" * 10_000,
+            # REPO_CONTEXT deliberately missing — mirrors cross-file path which
+            # uses DEPENDENCY_CONTEXT instead.
+        }
+        out = _fit_replacements_to_budget(self.TEMPLATE, reps, max_chars=1_000)
+        # Nothing to trim; returns dict with FULL_CONTENT intact.
+        assert out["FULL_CONTENT"] == reps["FULL_CONTENT"]
+        assert "REPO_CONTEXT" not in out or out["REPO_CONTEXT"] == ""
+
+    def test_trims_dependency_context(self):
+        template = "D:\n{{DEPENDENCY_CONTEXT}}\nC:\n{{FULL_CONTENT}}\n"
+        reps = {
+            "DEPENDENCY_CONTEXT": "d" * 5_000,
+            "FULL_CONTENT": "f" * 100,
+        }
+        out = _fit_replacements_to_budget(template, reps, max_chars=2_000)
+        assert "truncated" in out["DEPENDENCY_CONTEXT"] or "omitted" in out["DEPENDENCY_CONTEXT"]
+        assert out["FULL_CONTENT"] == reps["FULL_CONTENT"]
+
+    def test_warning_logged_when_trimming(self, caplog):
+        reps = self._base(repo_chars=5_000)
+        with caplog.at_level("WARNING"):
+            _fit_replacements_to_budget(
+                self.TEMPLATE, reps, max_chars=3_000, context_label="Foo.lean"
+            )
+        assert any("Foo.lean" in rec.message and "REPO_CONTEXT" in rec.message
+                   for rec in caplog.records)
 
 
 # --- Pydantic Schema Tests ---

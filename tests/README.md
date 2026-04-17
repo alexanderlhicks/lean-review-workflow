@@ -116,6 +116,17 @@ no-op cache methods, and Anthropic's "per-request ephemeral caching" sentinel.
 - **Diff parsing** (`TestSplitDiffIntoFiles`, `TestExtractAddedLines`,
   `TestGetDiffLines`) — unified-diff split into per-file chunks, extraction
   of added lines, rename handling, non-Lean files preserved.
+- **Prompt-size budget** (`TestFitPromptToBudget`) — the helper that trims
+  `REPO_CONTEXT` / `DEPENDENCY_CONTEXT` when the assembled prompt would
+  exceed the per-call character budget (`MAX_PROMPT_CHARS`, default
+  2.5M ≈ 830K tokens). Guards against the Anthropic 400
+  `prompt is too long` error; keeps the file under review, diff, and spec
+  checklist intact.
+- **`REPO_CONTEXT` rendering and filtering** (`TestFormatRepoFiles`) — the
+  helper that renders the discovered-files dict into the prompt block format
+  and drops sibling changed files from per-file reviews (each changed file
+  already has its own review pass, so including it in `REPO_CONTEXT` is
+  duplicate token spend).
 - **Lean-aware text handling** (`TestIsInComment`, `TestIsInString`) —
   single-line and block comments (including nested), string-literal
   recognition.
@@ -170,6 +181,10 @@ no-op cache methods, and Anthropic's "per-request ephemeral caching" sentinel.
 - `TestTransitiveDependencies` — BFS by depth; cycle-safe; depth tags are
   correct; excludes seed modules from results.
 - `TestBuildLeanFileIndex` — on-disk traversal; skips `.git/` and `.lake/`.
+- `TestPartitionContextTiers` — the full-context / summary-context split.
+  Changed files are preferred; depth-1 beats depth-2; the total tier size is
+  hard-capped at `CONTEXT_LIMIT` so very-large PRs demote overflow
+  (including excess changed files) to the summary tier.
 
 ## Patterns and conventions
 

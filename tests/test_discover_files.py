@@ -13,6 +13,7 @@ from discover_files import (
     get_transitive_dependencies,
     convert_module_to_file_path,
     build_lean_file_index,
+    partition_context_tiers,
 )
 from lean_utils import file_path_to_module_name
 
@@ -186,3 +187,45 @@ class TestBuildLeanFileIndex:
         monkeypatch.chdir(tmp_path)
         index = build_lean_file_index()
         assert index == []
+
+
+class TestPartitionContextTiers:
+    def test_changed_preferred_then_deps(self):
+        final = ["A.lean", "B.lean", "C.lean", "D.lean"]
+        changed = {"B.lean", "D.lean"}
+        depths = {"A.lean": 1, "C.lean": 2}
+        full, summary = partition_context_tiers(final, changed, depths, context_limit=10)
+        # Changed files first (ordered by their appearance in final), then
+        # others sorted by depth then name.
+        assert full[:2] == ["B.lean", "D.lean"]
+        assert full[2:] == ["A.lean", "C.lean"]
+        assert summary == []
+
+    def test_depth_ordering_within_non_changed(self):
+        final = ["A.lean", "B.lean", "C.lean", "D.lean"]
+        changed = set()
+        depths = {"A.lean": 2, "B.lean": 1, "C.lean": 2, "D.lean": 1}
+        full, _ = partition_context_tiers(final, changed, depths, context_limit=10)
+        # depth-1 before depth-2, tie-broken alphabetically.
+        assert full == ["B.lean", "D.lean", "A.lean", "C.lean"]
+
+    def test_hard_cap_demotes_overflow_deps(self):
+        final = [f"F{i}.lean" for i in range(10)]
+        changed = {"F0.lean", "F1.lean"}
+        depths = {f"F{i}.lean": 1 for i in range(2, 10)}
+        full, summary = partition_context_tiers(final, changed, depths, context_limit=5)
+        assert len(full) == 5
+        assert full[:2] == ["F0.lean", "F1.lean"]
+        assert len(summary) == 5  # the 5 overflow deps
+
+    def test_hard_cap_demotes_overflow_changed_files(self):
+        """If there are more changed files than CONTEXT_LIMIT, the excess
+        changed files should also fall through to summary — previously they
+        would escape the cap and blow the prompt budget."""
+        final = [f"C{i}.lean" for i in range(8)]
+        changed = set(final)  # all 8 are changed
+        full, summary = partition_context_tiers(final, changed, {}, context_limit=5)
+        assert len(full) == 5
+        assert len(summary) == 3
+        # All 8 still accounted for, order preserved.
+        assert full + summary == final
