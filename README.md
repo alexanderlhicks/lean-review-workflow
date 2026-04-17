@@ -213,7 +213,7 @@ jobs:
 | `additional_comments` | No | `""` | Extra focus instructions for the AI reviewer |
 | `lint` | No | `false` | Whether to run the Lean linter |
 | `dependency_depth` | No | `2` | Depth of transitive dependency traversal (1=direct only, 2=imports of imports) |
-| `thinking_budget` | No | `10240` | Thinking token budget for deep-analysis agents (Gemini/Anthropic; ignored by OpenAI) |
+| `thinking_budget` | No | `10240` | Thinking token budget for deep-analysis agents. On OpenAI, mapped to `reasoning.effort` (low/medium/high) and only applied to reasoning-capable models (o1/o3/o4/gpt-5). |
 | `spec_model` | No | `model` | Model override for the Specification Analyst agent |
 | `triage_model` | No | `model` | Model override for the Triage agent |
 | `review_model` | No | `model` | Model override for the per-file Code Reviewer agent |
@@ -224,9 +224,9 @@ jobs:
 
 | Feature | Gemini | Anthropic (Claude) | OpenAI (GPT) |
 |---------|--------|-------------------|--------------|
-| Structured output | Native schema | Tool use pattern | Native schema |
-| Native PDF | Yes | Yes (document blocks) | No (text extracted client-side via pymupdf) |
-| Extended thinking | ThinkingConfig | Thinking blocks | Not supported (ignored with warning) |
+| Structured output | Native schema | Tool use pattern | Native schema (Responses API `text_format`) |
+| Native PDF | Yes | Yes (document blocks) | Yes (`input_file` via Responses API) |
+| Extended thinking | ThinkingConfig | Thinking blocks | `reasoning.effort` on reasoning models (o1/o3/o4/gpt-5); ignored with warning on non-reasoning models |
 | Content caching | Server-side (TTL) | Per-request (ephemeral) | Automatic |
 
 ## Project Structure

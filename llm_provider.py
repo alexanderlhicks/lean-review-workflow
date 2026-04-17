@@ -337,57 +337,87 @@ class AnthropicProvider(LLMProvider):
 # ---------------------------------------------------------------------------
 
 class OpenAIProvider(LLMProvider):
-    """OpenAI GPT API provider. Uses beta.chat.completions.parse for structured output."""
+    """OpenAI GPT API provider. Uses the Responses API with structured output.
+
+    Reasoning-capable models (o1/o3/o4/gpt-5 families) map `thinking_budget` to
+    a `reasoning.effort` level. Non-reasoning models ignore `thinking_budget`
+    with a one-time warning. PDFs are sent natively via `input_file`.
+    """
+
+    # Model-name prefixes that accept the `reasoning` parameter.
+    _REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5")
 
     def __init__(self, api_key: str, **kwargs):
         super().__init__(**kwargs)
         from openai import OpenAI
         self.client = OpenAI(api_key=api_key)
 
-    def _to_messages(self, contents: List[ContentPart]) -> list:
-        """Convert ContentParts to OpenAI message format."""
+    def _to_input(self, contents: List[ContentPart]) -> list:
+        """Convert ContentParts to Responses API input blocks."""
+        import base64
         content_blocks = []
         for part in contents:
             if part.type == "text":
-                content_blocks.append({"type": "text", "text": part.data})
+                content_blocks.append({"type": "input_text", "text": part.data})
             elif part.type == "pdf":
-                # OpenAI doesn't support native PDFs — extract text
-                text = extract_pdf_text(part.data)
-                content_blocks.append({"type": "text", "text": f"[Extracted from PDF]\n{text}"})
+                b64 = base64.standard_b64encode(part.data).decode("utf-8")
+                content_blocks.append({
+                    "type": "input_file",
+                    "filename": "document.pdf",
+                    "file_data": f"data:application/pdf;base64,{b64}",
+                })
             elif part.type == "image":
-                import base64
                 b64 = base64.standard_b64encode(part.data).decode("utf-8")
                 mime = part.mime_type or "image/png"
                 content_blocks.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{mime};base64,{b64}"}
+                    "type": "input_image",
+                    "image_url": f"data:{mime};base64,{b64}",
                 })
             else:
                 logging.warning(f"Unknown ContentPart type '{part.type}' — skipping")
         return [{"role": "user", "content": content_blocks}]
 
+    def _is_reasoning_model(self, model: str) -> bool:
+        return model.startswith(self._REASONING_MODEL_PREFIXES)
+
+    @staticmethod
+    def _effort_for_budget(thinking_budget: int) -> str:
+        """Map an Anthropic-style token budget to an OpenAI effort level."""
+        if thinking_budget <= 2048:
+            return "low"
+        if thinking_budget <= 8192:
+            return "medium"
+        return "high"
+
     def _generate_once(self, model, contents, schema, thinking_budget=None, cache_name=None):
-        if thinking_budget and not self._thinking_warned:
-            logging.warning("OpenAI does not support extended thinking. thinking_budget will be ignored.")
-            self._thinking_warned = True
+        kwargs = {
+            'model': model,
+            'input': self._to_input(contents),
+            'text_format': schema,
+        }
 
-        messages = self._to_messages(contents)
-        response = self.client.beta.chat.completions.parse(
-            model=model,
-            messages=messages,
-            response_format=schema,
-        )
+        if thinking_budget:
+            if self._is_reasoning_model(model):
+                kwargs['reasoning'] = {'effort': self._effort_for_budget(thinking_budget)}
+            elif not self._thinking_warned:
+                logging.warning(
+                    f"Model '{model}' is not a reasoning model; thinking_budget will be ignored."
+                )
+                self._thinking_warned = True
 
-        parsed = response.choices[0].message.parsed
+        response = self.client.responses.parse(**kwargs)
+
+        parsed = response.output_parsed
         if parsed is None:
-            # Fallback: try manual parsing
-            raw = response.choices[0].message.content
-            parsed = schema.model_validate_json(raw)
+            raise ValueError("OpenAI response did not contain parsed structured output")
 
         usage = TokenUsage()
-        if hasattr(response, 'usage') and response.usage:
-            usage.input_tokens = getattr(response.usage, 'prompt_tokens', 0) or 0
-            usage.output_tokens = getattr(response.usage, 'completion_tokens', 0) or 0
+        if getattr(response, 'usage', None):
+            usage.input_tokens = getattr(response.usage, 'input_tokens', 0) or 0
+            usage.output_tokens = getattr(response.usage, 'output_tokens', 0) or 0
+            details = getattr(response.usage, 'output_tokens_details', None)
+            if details is not None:
+                usage.thinking_tokens = getattr(details, 'reasoning_tokens', 0) or 0
 
         return parsed, usage
 

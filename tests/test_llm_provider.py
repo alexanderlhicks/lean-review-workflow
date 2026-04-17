@@ -369,20 +369,33 @@ class TestOpenAIContentConversion:
             from llm_provider import OpenAIProvider
             provider = OpenAIProvider.__new__(OpenAIProvider)
             parts = [ContentPart(type="text", data="hello")]
-            messages = provider._to_messages(parts)
-            assert messages == [{"role": "user", "content": [{"type": "text", "text": "hello"}]}]
+            messages = provider._to_input(parts)
+            assert messages == [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
         except ImportError:
             pytest.skip("openai SDK not installed")
 
-    def test_pdf_fallback_to_text(self):
+    def test_pdf_sent_natively(self):
         try:
             from llm_provider import OpenAIProvider
             provider = OpenAIProvider.__new__(OpenAIProvider)
             parts = [ContentPart(type="pdf", data=b"fake pdf data")]
-            messages = provider._to_messages(parts)
-            # Should convert to text block via extract_pdf_text fallback
-            assert messages[0]["content"][0]["type"] == "text"
-            assert "[Extracted from PDF]" in messages[0]["content"][0]["text"]
+            messages = provider._to_input(parts)
+            block = messages[0]["content"][0]
+            assert block["type"] == "input_file"
+            assert block["filename"].endswith(".pdf")
+            assert block["file_data"].startswith("data:application/pdf;base64,")
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_image_uses_input_image(self):
+        try:
+            from llm_provider import OpenAIProvider
+            provider = OpenAIProvider.__new__(OpenAIProvider)
+            parts = [ContentPart(type="image", data=b"\x89PNG...", mime_type="image/png")]
+            messages = provider._to_input(parts)
+            block = messages[0]["content"][0]
+            assert block["type"] == "input_image"
+            assert block["image_url"].startswith("data:image/png;base64,")
         except ImportError:
             pytest.skip("openai SDK not installed")
 
@@ -394,8 +407,41 @@ class TestOpenAIContentConversion:
                 ContentPart(type="text", data="hello"),
                 ContentPart(type="unknown", data="mystery"),
             ]
-            messages = provider._to_messages(parts)
+            messages = provider._to_input(parts)
             assert len(messages[0]["content"]) == 1
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+
+class TestOpenAIReasoning:
+    def _provider(self):
+        from llm_provider import OpenAIProvider
+        provider = OpenAIProvider.__new__(OpenAIProvider)
+        provider._thinking_warned = False
+        return provider
+
+    def test_reasoning_model_detection(self):
+        try:
+            p = self._provider()
+            assert p._is_reasoning_model("gpt-5")
+            assert p._is_reasoning_model("gpt-5-mini")
+            assert p._is_reasoning_model("o1-preview")
+            assert p._is_reasoning_model("o3-mini")
+            assert p._is_reasoning_model("o4-mini")
+            assert not p._is_reasoning_model("gpt-4o")
+            assert not p._is_reasoning_model("gpt-4.1")
+        except ImportError:
+            pytest.skip("openai SDK not installed")
+
+    def test_effort_for_budget(self):
+        try:
+            from llm_provider import OpenAIProvider
+            assert OpenAIProvider._effort_for_budget(1) == "low"
+            assert OpenAIProvider._effort_for_budget(2048) == "low"
+            assert OpenAIProvider._effort_for_budget(2049) == "medium"
+            assert OpenAIProvider._effort_for_budget(8192) == "medium"
+            assert OpenAIProvider._effort_for_budget(8193) == "high"
+            assert OpenAIProvider._effort_for_budget(10240) == "high"
         except ImportError:
             pytest.skip("openai SDK not installed")
 
