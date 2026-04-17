@@ -266,6 +266,22 @@ class AnthropicProvider(LLMProvider):
         content_blocks = self._to_content_blocks(contents, cache_name)
         tool_schema = schema.model_json_schema()
 
+        # Anthropic forbids forced tool_choice ('any' or specific 'tool') while
+        # extended thinking is enabled. Fall back to 'auto' in that case and
+        # steer the model with an explicit instruction.
+        if thinking_budget:
+            content_blocks = content_blocks + [{
+                "type": "text",
+                "text": (
+                    f"Respond by calling the `submit_review` tool exactly once "
+                    f"with a valid {schema.__name__} object. Do not emit the "
+                    f"result as plain text."
+                ),
+            }]
+            tool_choice = {'type': 'auto'}
+        else:
+            tool_choice = {'type': 'tool', 'name': 'submit_review'}
+
         kwargs = {
             'model': model,
             'max_tokens': 16384,
@@ -275,7 +291,7 @@ class AnthropicProvider(LLMProvider):
                 'description': f'Submit structured results as a {schema.__name__} object.',
                 'input_schema': tool_schema,
             }],
-            'tool_choice': {'type': 'tool', 'name': 'submit_review'},
+            'tool_choice': tool_choice,
         }
 
         if thinking_budget:
